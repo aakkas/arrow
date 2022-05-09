@@ -298,6 +298,26 @@ class ColumnChunkMetaData::ColumnChunkMetaDataImpl {
     }
   }
 
+  inline bool has_column_index() const { return column_->__isset.column_index_offset; }
+
+  inline int64_t column_index_offset() const { return column_->column_index_offset; }
+
+  inline int32_t column_index_length() const { return column_->column_index_length; }
+
+  inline bool has_offset_index() const { return column_->__isset.offset_index_offset; }
+
+  inline int64_t offset_index_offset() const { return column_->offset_index_offset; }
+
+  inline int32_t offset_index_length() const { return column_->offset_index_length; }
+
+  inline bool has_bloom_filter() const {
+    return column_metadata_->__isset.bloom_filter_offset;
+  }
+
+  inline int64_t bloom_filter_offset() const {
+    return column_metadata_->bloom_filter_offset;
+  }
+
  private:
   mutable std::shared_ptr<Statistics> possible_stats_;
   std::vector<Encoding::type> encodings_;
@@ -392,6 +412,32 @@ int64_t ColumnChunkMetaData::total_compressed_size() const {
 
 std::unique_ptr<ColumnCryptoMetaData> ColumnChunkMetaData::crypto_metadata() const {
   return impl_->crypto_metadata();
+}
+
+bool ColumnChunkMetaData::has_column_index() const { return impl_->has_column_index(); }
+
+int64_t ColumnChunkMetaData::column_index_offset() const {
+  return impl_->column_index_offset();
+}
+
+int32_t ColumnChunkMetaData::column_index_length() const {
+  return impl_->column_index_length();
+}
+
+bool ColumnChunkMetaData::has_offset_index() const { return impl_->has_offset_index(); }
+
+int64_t ColumnChunkMetaData::offset_index_offset() const {
+  return impl_->offset_index_offset();
+}
+
+int32_t ColumnChunkMetaData::offset_index_length() const {
+  return impl_->offset_index_length();
+}
+
+bool ColumnChunkMetaData::has_bloom_filter() const { return impl_->has_bloom_filter(); }
+
+int64_t ColumnChunkMetaData::bloom_filter_offset() const {
+  return impl_->bloom_filter_offset();
 }
 
 bool ColumnChunkMetaData::Equals(const ColumnChunkMetaData& other) const {

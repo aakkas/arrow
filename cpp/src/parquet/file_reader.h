@@ -34,6 +34,7 @@ class ColumnReader;
 class FileMetaData;
 class PageReader;
 class RowGroupMetaData;
+class ColumnIndex;
 
 class PARQUET_EXPORT RowGroupReader {
  public:
@@ -45,6 +46,7 @@ class PARQUET_EXPORT RowGroupReader {
     virtual std::unique_ptr<PageReader> GetColumnPageReader(int i) = 0;
     virtual const RowGroupMetaData* metadata() const = 0;
     virtual const ReaderProperties* properties() const = 0;
+    virtual std::shared_ptr<parquet::ColumnIndex> ReadColumnIndex(int i) = 0;
   };
 
   explicit RowGroupReader(std::unique_ptr<Contents> contents);
@@ -55,6 +57,10 @@ class PARQUET_EXPORT RowGroupReader {
   // Construct a ColumnReader for the indicated row group-relative
   // column. Ownership is shared with the RowGroupReader.
   std::shared_ptr<ColumnReader> Column(int i);
+
+  // Construct a ColumnIndex for the indicated row group-relative
+  // column. Ownership is shared with the RowGroupReader.
+  std::shared_ptr<ColumnIndex> ReadColumnIndex(int i);
 
   // Construct a ColumnReader, trying to enable exposed encoding.
   //

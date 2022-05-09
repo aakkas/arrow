@@ -32,7 +32,9 @@
 #include "arrow/util/future.h"
 #include "arrow/util/int_util_internal.h"
 #include "arrow/util/logging.h"
+#include "arrow/util/optional.h"
 #include "arrow/util/ubsan.h"
+#include "parquet/column_index.h"
 #include "parquet/column_reader.h"
 #include "parquet/column_scanner.h"
 #include "parquet/encryption/encryption_internal.h"
@@ -43,9 +45,12 @@
 #include "parquet/platform.h"
 #include "parquet/properties.h"
 #include "parquet/schema.h"
+#include "parquet/thrift_internal.h"
 #include "parquet/types.h"
 
 using arrow::internal::AddWithOverflow;
+using arrow::util::nullopt;
+using arrow::util::optional;
 
 namespace parquet {
 
@@ -55,6 +60,60 @@ static constexpr uint32_t kFooterSize = 8;
 
 // For PARQUET-816
 static constexpr int64_t kMaxDictHeaderSize = 100;
+
+template <typename DType>
+static std::shared_ptr<parquet::ColumnIndex> MakeTypedColumnIndex(
+    const format::ColumnIndex& column_index, const format::OffsetIndex& offset_index,
+    const int64_t num_rows, const int64_t num_values, const ColumnDescriptor* descr) {
+  optional<std::vector<int64_t>> null_counts = nullopt;
+  if (column_index.__isset.null_counts) {
+    null_counts = column_index.null_counts;
+  }
+
+  auto boundary_order = LoadEnumSafe(&column_index.boundary_order);
+
+  const auto& pl = offset_index.page_locations;
+  const auto page_count = offset_index.page_locations.size();
+  std::vector<PageLocation> page_locations(page_count);
+
+  int64_t nr = num_rows;
+  for (size_t i = page_count - 1; i >= 0; i--) {
+    const int64_t p_rows = nr - pl[i].first_row_index;
+    page_locations[i] = {pl[i].offset, pl[i].compressed_page_size, pl[i].first_row_index,
+                         p_rows};
+    nr -= p_rows;
+  }
+
+  return MakeColumnIndex<DType>(descr, boundary_order, column_index.null_pages,
+                                column_index.min_values, column_index.max_values,
+                                std::move(page_locations), std::move(null_counts));
+}
+
+std::shared_ptr<parquet::ColumnIndex> MakeColumnIndex(
+    const Type::type column_type, const format::ColumnIndex& column_index,
+    const format::OffsetIndex& offset_index, const int64_t num_rows,
+    const int64_t num_values, const ColumnDescriptor* descr) {
+#define MAKE_TYPED_COL_INDEX(CAP_TYPE, KLASS)                                      \
+  case Type::CAP_TYPE:                                                             \
+    return MakeTypedColumnIndex<BooleanType>(column_index, offset_index, num_rows, \
+                                             num_values, descr)
+
+  switch (column_type) {
+    MAKE_TYPED_COL_INDEX(BOOLEAN, BooleanType);
+    MAKE_TYPED_COL_INDEX(INT32, Int32Type);
+    MAKE_TYPED_COL_INDEX(INT64, Int64Type);
+    MAKE_TYPED_COL_INDEX(INT96, Int96Type);
+    MAKE_TYPED_COL_INDEX(FLOAT, FloatType);
+    MAKE_TYPED_COL_INDEX(DOUBLE, DoubleType);
+    MAKE_TYPED_COL_INDEX(BYTE_ARRAY, ByteArrayType);
+    MAKE_TYPED_COL_INDEX(FIXED_LEN_BYTE_ARRAY, FLBAType);
+    default:
+      break;
+  }
+#undef MAKE_TYPED_COL_INDEX
+
+  throw ParquetException("Can't decode columnd index for selected column type");
+}
 
 // ----------------------------------------------------------------------
 // RowGroupReader public API
@@ -75,6 +134,19 @@ std::shared_ptr<ColumnReader> RowGroupReader::Column(int i) {
   return ColumnReader::Make(
       descr, std::move(page_reader),
       const_cast<ReaderProperties*>(contents_->properties())->memory_pool());
+}
+
+// Construct a ColumnIndex for the indicated row group-relative
+// column. Ownership is shared with the RowGroupReader.
+std::shared_ptr<parquet::ColumnIndex> RowGroupReader::ReadColumnIndex(int i) {
+  if (i >= metadata()->num_columns()) {
+    std::stringstream ss;
+    ss << "Trying to read column index " << i << " but row group metadata has only "
+       << metadata()->num_columns() << " columns";
+    throw ParquetException(ss.str());
+  }
+
+  return contents_->ReadColumnIndex(i);
 }
 
 std::shared_ptr<ColumnReader> RowGroupReader::ColumnWithExposeEncoding(
@@ -249,6 +321,47 @@ class SerializedRowGroup : public RowGroupReader::Contents {
                       static_cast<int16_t>(i), meta_decryptor, data_decryptor);
     return PageReader::Open(stream, col->num_values(), col->compression(),
                             properties_.memory_pool(), &ctx);
+  }
+
+  std::shared_ptr<parquet::ColumnIndex> ReadColumnIndex(int i) override {
+    auto column_metadata = metadata()->ColumnChunk(i);
+    if (!column_metadata->has_column_index()) {
+      return nullptr;
+    }
+
+    std::shared_ptr<Decryptor> decryptor;
+    auto cryto_metadata = column_metadata->crypto_metadata();
+    if (cryto_metadata != nullptr) {
+      if (cryto_metadata->encrypted_with_footer_key()) {
+        decryptor = file_decryptor_->GetFooterDecryptor();
+      } else {
+        std::string aad_column_metadata = encryption::CreateModuleAad(
+            file_decryptor_->file_aad(), encryption::kColumnIndex, row_group_ordinal_,
+            static_cast<int16_t>(i), static_cast<int16_t>(-1));
+
+        decryptor = file_decryptor_->GetColumnMetaDecryptor(
+            cryto_metadata->path_in_schema()->ToDotString(),
+            cryto_metadata->key_metadata(), aad_column_metadata);
+      }
+    }
+
+    PARQUET_ASSIGN_OR_THROW(auto buffer_ci,
+                            source_->ReadAt(column_metadata->column_index_offset(),
+                                            column_metadata->column_index_length()));
+    format::ColumnIndex column_index;
+    uint32_t len = static_cast<uint32_t>(column_metadata->column_index_length());
+    DeserializeThriftMsg(buffer_ci->data(), &len, &column_index, decryptor);
+
+    PARQUET_ASSIGN_OR_THROW(auto buffer_oi,
+                            source_->ReadAt(column_metadata->offset_index_offset(),
+                                            column_metadata->offset_index_length()));
+    format::OffsetIndex offset_index;
+    len = static_cast<uint32_t>(column_metadata->offset_index_length());
+    DeserializeThriftMsg(buffer_oi->data(), &len, &offset_index, decryptor);
+
+    const ColumnDescriptor* descr = metadata()->schema()->Column(i);
+    return MakeColumnIndex(column_metadata->type(), column_index, offset_index,
+                           metadata()->num_rows(), column_metadata->num_values(), descr);
   }
 
  private:

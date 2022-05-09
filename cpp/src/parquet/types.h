@@ -129,6 +129,16 @@ struct SortOrder {
   enum type { SIGNED, UNSIGNED, UNKNOWN };
 };
 
+struct BoundaryOrder {
+  enum type {
+    UNORDERED = 0,
+    ASCENDING = 1,
+    DESCENDING = 2,
+    // Should always be last element.
+    UNDEFINED = 3
+  };
+};
+
 namespace schema {
 
 struct DecimalMetadata {
