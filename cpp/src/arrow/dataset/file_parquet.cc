@@ -33,6 +33,7 @@
 #include "arrow/util/future.h"
 #include "arrow/util/iterator.h"
 #include "arrow/util/logging.h"
+#include "arrow/util/mutex.h"
 #include "arrow/util/range.h"
 #include "arrow/util/tracing_internal.h"
 #include "parquet/arrow/reader.h"
@@ -245,12 +246,9 @@ Status ResolveOneFieldRef(
 }
 
 // Compute the column projection based on the scan options
-Result<std::vector<int>> InferColumnProjection(const parquet::arrow::FileReader& reader,
-                                               const ScanOptions& options) {
-  auto manifest = reader.manifest();
-  // Checks if the field is needed in either the projection or the filter.
-  auto field_refs = options.MaterializedFields();
-
+Result<std::vector<int>> InferColumnProjection(
+    const parquet::arrow::SchemaManifest& manifest,
+    const std::vector<FieldRef>& field_refs) {
   // Build a lookup table from top level field name to field metadata.
   // This is to avoid quadratic-time mapping of projected fields to
   // column indices, in the common case of selecting top level
@@ -273,6 +271,22 @@ Result<std::vector<int>> InferColumnProjection(const parquet::arrow::FileReader&
                                      &columns_selection));
   }
   return columns_selection;
+}
+
+// Compute the column projection based on the scan options
+Result<std::vector<int>> InferColumnProjection(const parquet::arrow::FileReader& reader,
+                                               const ScanOptions& options) {
+  // Checks if the field is needed in either the projection or the filter.
+  auto manifest = reader.manifest();
+  return InferColumnProjection(manifest, options.MaterializedFields());
+}
+
+// Compute the column projection based on the scan options
+Result<std::vector<int>> InferColumnProjection(
+    const parquet::arrow::SchemaManifest& manifest,
+    const compute::Expression& predicate) {
+  // Checks if the field is needed in either the projection or the filter.
+  return InferColumnProjection(manifest, FieldsInExpression(predicate));
 }
 
 Status WrapSourceError(const Status& status, const std::string& path) {
@@ -301,6 +315,140 @@ Result<bool> IsSupportedParquetFile(const ParquetFileFormat& format,
 }
 
 }  // namespace
+
+//
+// ParquetColumnIndexProvider
+//
+
+class ParquetColumnIndexProviderImpl : public ParquetColumnIndexProvider {
+ public:
+  ParquetColumnIndexProviderImpl(std::shared_ptr<ParquetFileFormat> parquet_format,
+                                 FileSource metadata_source,
+                                 std::shared_ptr<parquet::FileMetaData> metadata,
+                                 std::shared_ptr<parquet::arrow::SchemaManifest> manifest)
+      : parquet_format_(std::move(parquet_format)),
+        metadata_source_(std::move(metadata_source)),
+        metadata_(std::move(metadata)),
+        manifest_(std::move(manifest)) {}
+
+  static std::shared_ptr<ParquetColumnIndexProvider> Make(
+      std::shared_ptr<ParquetFileFormat> parquet_format, FileSource metadata_source,
+      std::shared_ptr<parquet::FileMetaData> metadata,
+      std::shared_ptr<parquet::arrow::SchemaManifest> manifest) {
+    return std::make_shared<ParquetColumnIndexProviderImpl>(
+        std::move(parquet_format), std::move(metadata_source), std::move(metadata),
+        std::move(manifest));
+  }
+
+  std::shared_ptr<parquet::ColumnIndex> GetColumnIndex(int row_group,
+                                                       int column) const override {
+    auto lock = mutex_.Lock();
+    return GetColumnIndex_(row_group, column);
+  }
+
+  Result<bool> HasColumnIndexes(const compute::Expression& predicate,
+                                const std::vector<int>& row_groups) const override {
+    if (row_groups.empty()) {
+      return true;
+    }
+
+    ARROW_ASSIGN_OR_RAISE(auto columns, InferColumnProjection(*manifest_, predicate));
+
+    return HasColumnIndexes(columns, row_groups);
+  }
+
+  bool HasColumnIndexes(const std::vector<int>& columns,
+                        const std::vector<int>& row_groups) const override {
+    if (row_groups.empty() || columns.empty()) {
+      return true;
+    }
+
+    auto lock = mutex_.Lock();
+    for (const auto r : row_groups) {
+      if (!HasColumnIndexes_(r, columns)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  const Status EnsureCompleteColumnIndexes(const compute::Expression& predicate,
+                                           const std::vector<int>& row_groups) override {
+    if (row_groups.empty()) {
+      return Status::OK();
+    }
+
+    ARROW_ASSIGN_OR_RAISE(auto columns, InferColumnProjection(*manifest_, predicate));
+
+    return EnsureCompleteColumnIndexes(columns, row_groups);
+  }
+
+  const Status EnsureCompleteColumnIndexes(const std::vector<int>& columns,
+                                           const std::vector<int>& row_groups) override {
+    if (HasColumnIndexes(columns, row_groups)) {
+      return Status::OK();
+    }
+
+    auto scan_options = std::make_shared<ScanOptions>();
+    ARROW_ASSIGN_OR_RAISE(auto reader,
+                          parquet_format_->GetReader(metadata_source_, scan_options));
+
+    for (const auto r : row_groups) {
+      ReadColumnIndexes(reader, r, columns);
+    }
+
+    return Status::OK();
+  }
+
+ private:
+  const std::shared_ptr<parquet::ColumnIndex> GetColumnIndex_(int row_group,
+                                                              int column) const {
+    const auto& it_rg = column_indexes_.find(row_group);
+    if (it_rg != column_indexes_.end()) {
+      const auto& it_c = it_rg->second.find(column);
+      if (it_c != it_rg->second.end()) {
+        return it_c->second;
+      }
+    }
+
+    return nullptr;
+  }
+
+  bool HasColumnIndexes_(const int row_group, const std::vector<int>& columns) const {
+    for (const auto c : columns) {
+      if (!GetColumnIndex_(row_group, c)) {
+        return false;
+      }
+    }
+
+    return false;
+  }
+
+  void ReadColumnIndexes(const std::shared_ptr<parquet::arrow::FileReader> reader,
+                         const int row_group, const std::vector<int>& columns) {
+    if (!HasColumnIndexes({row_group}, columns)) {
+      auto row_group_reader = reader->parquet_reader()->RowGroup(row_group);
+
+      for (const auto c : columns) {
+        if (!GetColumnIndex(row_group, c)) {
+          auto column_index = row_group_reader->ReadColumnIndex(c);
+
+          auto lock = mutex_.Lock();
+          column_indexes_[row_group][c] = std::move(column_index);
+        }
+      }
+    }
+  }
+
+  std::shared_ptr<ParquetFileFormat> parquet_format_;
+  FileSource metadata_source_;
+  std::shared_ptr<parquet::FileMetaData> metadata_;
+  std::shared_ptr<parquet::arrow::SchemaManifest> manifest_;
+  std::unordered_map<int, std::unordered_map<int, std::shared_ptr<parquet::ColumnIndex>>>
+      column_indexes_;
+  mutable util::Mutex mutex_;
+};
 
 bool ParquetFileFormat::Equals(const FileFormat& other) const {
   if (other.type_name() != type_name()) return false;
@@ -436,7 +584,9 @@ Result<RecordBatchGenerator> ParquetFileFormat::ScanBatchesAsync(
   // a FileReader, potentially avoiding IO altogether if all RowGroups are excluded due to
   // prior statistics knowledge. In the case where a RowGroup doesn't have statistics
   // metdata, it will not be excluded.
-  if (parquet_fragment->metadata() != nullptr) {
+  ARROW_ASSIGN_OR_RAISE(const auto has_complete_metadata,
+                        parquet_fragment->HasCompleteMetadata());
+  if (has_complete_metadata) {
     ARROW_ASSIGN_OR_RAISE(row_groups, parquet_fragment->FilterRowGroups(options->filter));
     pre_filtered = true;
     if (row_groups.empty()) return MakeEmptyGenerator<std::shared_ptr<RecordBatch>>();
@@ -447,7 +597,7 @@ Result<RecordBatchGenerator> ParquetFileFormat::ScanBatchesAsync(
       [=](const std::shared_ptr<parquet::arrow::FileReader>& reader) mutable
       -> Result<RecordBatchGenerator> {
     // Ensure that parquet_fragment has FileMetaData
-    RETURN_NOT_OK(parquet_fragment->EnsureCompleteMetadata(reader.get()));
+    RETURN_NOT_OK(parquet_fragment->EnsureCompleteMetadata(options->filter, reader));
     if (!pre_filtered) {
       // row groups were not already filtered; do this now
       ARROW_ASSIGN_OR_RAISE(row_groups,
@@ -456,6 +606,9 @@ Result<RecordBatchGenerator> ParquetFileFormat::ScanBatchesAsync(
     }
     ARROW_ASSIGN_OR_RAISE(auto column_projection,
                           InferColumnProjection(*reader, *options));
+
+    // TODO: filter by column groups
+
     ARROW_ASSIGN_OR_RAISE(
         auto parquet_scan_options,
         GetFragmentScanOptions<ParquetFragmentScanOptions>(
@@ -482,7 +635,10 @@ Future<util::optional<int64_t>> ParquetFileFormat::CountRows(
     const std::shared_ptr<FileFragment>& file, compute::Expression predicate,
     const std::shared_ptr<ScanOptions>& options) {
   auto parquet_file = checked_pointer_cast<ParquetFileFragment>(file);
-  if (parquet_file->metadata()) {
+  ARROW_ASSIGN_OR_RAISE(const auto has_complete_metadata,
+                        parquet_file->HasCompleteMetadata(predicate));
+
+  if (has_complete_metadata) {
     ARROW_ASSIGN_OR_RAISE(auto maybe_count,
                           parquet_file->TryCountRows(std::move(predicate)));
     return Future<util::optional<int64_t>>::MakeFinished(maybe_count);
@@ -497,10 +653,12 @@ Future<util::optional<int64_t>> ParquetFileFormat::CountRows(
 
 Result<std::shared_ptr<ParquetFileFragment>> ParquetFileFormat::MakeFragment(
     FileSource source, compute::Expression partition_expression,
-    std::shared_ptr<Schema> physical_schema, std::vector<int> row_groups) {
-  return std::shared_ptr<ParquetFileFragment>(new ParquetFileFragment(
-      std::move(source), shared_from_this(), std::move(partition_expression),
-      std::move(physical_schema), std::move(row_groups)));
+    std::shared_ptr<Schema> physical_schema, std::vector<int> row_groups,
+    std::shared_ptr<ParquetColumnIndexProvider> column_index_provider) {
+  return std::shared_ptr<ParquetFileFragment>(
+      new ParquetFileFragment(std::move(source), shared_from_this(),
+                              std::move(partition_expression), std::move(physical_schema),
+                              std::move(row_groups), std::move(column_index_provider)));
 }
 
 Result<std::shared_ptr<FileFragment>> ParquetFileFormat::MakeFragment(
@@ -565,29 +723,58 @@ Future<> ParquetFileWriter::FinishInternal() {
 // ParquetFileFragment
 //
 
-ParquetFileFragment::ParquetFileFragment(FileSource source,
-                                         std::shared_ptr<FileFormat> format,
-                                         compute::Expression partition_expression,
-                                         std::shared_ptr<Schema> physical_schema,
-                                         util::optional<std::vector<int>> row_groups)
+ParquetFileFragment::ParquetFileFragment(
+    FileSource source, std::shared_ptr<FileFormat> format,
+    compute::Expression partition_expression, std::shared_ptr<Schema> physical_schema,
+    util::optional<std::vector<int>> row_groups,
+    std::shared_ptr<ParquetColumnIndexProvider> column_index_provider)
     : FileFragment(std::move(source), std::move(format), std::move(partition_expression),
                    std::move(physical_schema)),
-      parquet_format_(checked_cast<ParquetFileFormat&>(*format_)),
-      row_groups_(std::move(row_groups)) {}
+      row_groups_(std::move(row_groups)),
+      column_index_provider_(std::move(column_index_provider)) {}
 
-Status ParquetFileFragment::EnsureCompleteMetadata(parquet::arrow::FileReader* reader) {
+const std::shared_ptr<ParquetFileFormat> ParquetFileFragment::parquet_format() const {
+  return checked_pointer_cast<ParquetFileFormat>(format_);
+}
+
+Result<bool> ParquetFileFragment::HasCompleteMetadata(
+    const util::optional<compute::Expression>& maybe_predicate) {
   auto lock = physical_schema_mutex_.Lock();
-  if (metadata_ != nullptr) {
-    return Status::OK();
+  if (metadata_ == nullptr) {
+    return false;
+  } else if (maybe_predicate.has_value() && row_groups_.has_value()) {
+    DCHECK_NE(column_index_provider_, nullptr);
+    return column_index_provider_->HasColumnIndexes(maybe_predicate.value(),
+                                                    *row_groups_);
+  }
+
+  return true;
+}
+
+Status ParquetFileFragment::EnsureCompleteMetadata(
+    const util::optional<compute::Expression>& maybe_predicate,
+    std::shared_ptr<parquet::arrow::FileReader> reader) {
+  {
+    auto lock = physical_schema_mutex_.Lock();
+    if (metadata_ != nullptr) {
+      if (maybe_predicate.has_value() && row_groups_.has_value()) {
+        DCHECK_NE(column_index_provider_, nullptr);
+        RETURN_NOT_OK(column_index_provider_->EnsureCompleteColumnIndexes(
+            maybe_predicate.value(), *row_groups_));
+      }
+
+      return Status::OK();
+    }
   }
 
   if (reader == nullptr) {
-    lock.Unlock();
     auto scan_options = std::make_shared<ScanOptions>();
-    ARROW_ASSIGN_OR_RAISE(auto reader, parquet_format_.GetReader(source_, scan_options));
-    return EnsureCompleteMetadata(reader.get());
+    ARROW_ASSIGN_OR_RAISE(auto reader,
+                          parquet_format()->GetReader(source_, scan_options));
+    return EnsureCompleteMetadata(maybe_predicate, std::move(reader));
   }
 
+  auto lock = physical_schema_mutex_.Lock();
   std::shared_ptr<Schema> schema;
   RETURN_NOT_OK(reader->GetSchema(&schema));
   if (physical_schema_ && !physical_schema_->Equals(*schema)) {
@@ -604,7 +791,16 @@ Status ParquetFileFragment::EnsureCompleteMetadata(parquet::arrow::FileReader* r
   ARROW_ASSIGN_OR_RAISE(
       auto manifest,
       GetSchemaManifest(*reader->parquet_reader()->metadata(), reader->properties()));
-  return SetMetadata(reader->parquet_reader()->metadata(), std::move(manifest));
+  RETURN_NOT_OK(SetMetadata(reader->parquet_reader()->metadata(), std::move(manifest)));
+
+  column_index_provider_ = ParquetColumnIndexProviderImpl::Make(parquet_format(), source_,
+                                                                metadata_, manifest_);
+  if (maybe_predicate.has_value() && row_groups_.has_value()) {
+    RETURN_NOT_OK(column_index_provider_->EnsureCompleteColumnIndexes(
+        maybe_predicate.value(), *row_groups_));
+  }
+
+  return Status::OK();
 }
 
 Status ParquetFileFragment::SetMetadata(
@@ -632,15 +828,16 @@ Status ParquetFileFragment::SetMetadata(
 
 Result<FragmentVector> ParquetFileFragment::SplitByRowGroup(
     compute::Expression predicate) {
-  RETURN_NOT_OK(EnsureCompleteMetadata());
+  RETURN_NOT_OK(EnsureCompleteMetadata(predicate));
   ARROW_ASSIGN_OR_RAISE(auto row_groups, FilterRowGroups(predicate));
 
   FragmentVector fragments(row_groups.size());
   int i = 0;
   for (int row_group : row_groups) {
-    ARROW_ASSIGN_OR_RAISE(auto fragment,
-                          parquet_format_.MakeFragment(source_, partition_expression(),
-                                                       physical_schema_, {row_group}));
+    ARROW_ASSIGN_OR_RAISE(
+        auto fragment,
+        parquet_format()->MakeFragment(source_, partition_expression(), physical_schema_,
+                                       {row_group}, column_index_provider_));
 
     RETURN_NOT_OK(fragment->SetMetadata(metadata_, manifest_));
     fragments[i++] = std::move(fragment);
@@ -659,9 +856,10 @@ Result<std::shared_ptr<Fragment>> ParquetFileFragment::Subset(
 Result<std::shared_ptr<Fragment>> ParquetFileFragment::Subset(
     std::vector<int> row_groups) {
   RETURN_NOT_OK(EnsureCompleteMetadata());
-  ARROW_ASSIGN_OR_RAISE(auto new_fragment, parquet_format_.MakeFragment(
-                                               source_, partition_expression(),
-                                               physical_schema_, std::move(row_groups)));
+  ARROW_ASSIGN_OR_RAISE(
+      auto new_fragment,
+      parquet_format()->MakeFragment(source_, partition_expression(), physical_schema_,
+                                     std::move(row_groups), column_index_provider_));
 
   RETURN_NOT_OK(new_fragment->SetMetadata(metadata_, manifest_));
   return new_fragment;
@@ -692,9 +890,11 @@ Result<std::vector<int>> ParquetFileFragment::FilterRowGroups(
 
 Result<std::vector<compute::Expression>> ParquetFileFragment::TestRowGroups(
     compute::Expression predicate) {
+  ARROW_ASSIGN_OR_RAISE(const auto has_complete_metadata, HasCompleteMetadata());
+  DCHECK(has_complete_metadata);
+
   auto lock = physical_schema_mutex_.Lock();
 
-  DCHECK_NE(metadata_, nullptr);
   ARROW_ASSIGN_OR_RAISE(
       predicate, SimplifyWithGuarantee(std::move(predicate), partition_expression_));
 
@@ -736,7 +936,9 @@ Result<std::vector<compute::Expression>> ParquetFileFragment::TestRowGroups(
 
 Result<util::optional<int64_t>> ParquetFileFragment::TryCountRows(
     compute::Expression predicate) {
-  DCHECK_NE(metadata_, nullptr);
+  ARROW_ASSIGN_OR_RAISE(const auto has_complete_metadata, HasCompleteMetadata(predicate));
+  DCHECK(has_complete_metadata);
+
   if (ExpressionHasFieldRefs(predicate)) {
 #if defined(__GNUC__) && (__GNUC__ < 5)
     // ARROW-12694: with GCC 4.9 (RTools 35) we sometimes segfault here if we move(result)
@@ -879,7 +1081,7 @@ Result<std::shared_ptr<DatasetFactory>> ParquetDatasetFactory::Make(
   return std::shared_ptr<DatasetFactory>(new ParquetDatasetFactory(
       std::move(filesystem), std::move(format), std::move(metadata), std::move(manifest),
       std::move(physical_schema), base_path, std::move(options),
-      std::move(paths_with_row_group_ids)));
+      std::move(paths_with_row_group_ids), metadata_source));
 }
 
 Result<std::vector<std::shared_ptr<FileFragment>>>
@@ -897,10 +1099,14 @@ ParquetDatasetFactory::CollectParquetFragments(const Partitioning& partitioning)
         partitioning.Parse(StripPrefixAndFilename(path, options_.partition_base_dir))
             .ValueOr(compute::literal(true));
 
+    auto column_index_provider = ParquetColumnIndexProviderImpl::Make(
+        format_, metadata_source_, metadata_subset, manifest_);
+
     ARROW_ASSIGN_OR_RAISE(
         auto fragment,
         format_->MakeFragment({path, filesystem_}, std::move(partition_expression),
-                              physical_schema_, std::move(row_groups)));
+                              physical_schema_, std::move(row_groups),
+                              std::move(column_index_provider)));
 
     RETURN_NOT_OK(fragment->SetMetadata(metadata_subset, manifest_));
     fragments[i++] = std::move(fragment);
