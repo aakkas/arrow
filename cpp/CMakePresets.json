@@ -15,8 +15,27 @@
       }
     },
     {
+      "name": "base-xcode",
+      "hidden": true,
+      "generator": "Xcode",
+      "cacheVariables": {
+        "ARROW_BUILD_STATIC": "OFF"
+      }
+    },
+    {
       "name": "base-debug",
       "inherits": "base",
+      "hidden": true,
+      "cacheVariables": {
+        "ARROW_BUILD_INTEGRATION": "ON",
+        "ARROW_BUILD_TESTS": "ON",
+        "ARROW_EXTRA_ERROR_CONTEXT": "ON",
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "base-debug-xcode",
+      "inherits": "base-xcode",
       "hidden": true,
       "cacheVariables": {
         "ARROW_BUILD_INTEGRATION": "ON",
@@ -170,6 +189,24 @@
       "inherits": ["base-debug", "features-main"],
       "displayName": "Debug build with tests and more optional components",
       "cacheVariables": {}
+    },
+    {
+      "name": "ninja-debug-akkas",
+      "inherits": ["base-debug", "features-main"],
+      "displayName": "Debug build with tests and more optional components",
+      "cacheVariables": {
+        "PARQUET_BUILD_EXAMPLES": "ON",
+        "PARQUET_BUILD_EXECUTABLES": "ON"
+      }
+    },
+    {
+      "name": "xcode-debug-akkas",
+      "inherits": ["base-debug-xcode", "features-main"],
+      "displayName": "Debug build with tests and more optional components",
+      "cacheVariables": {
+        "PARQUET_BUILD_EXAMPLES": "ON",
+        "PARQUET_BUILD_EXECUTABLES": "ON"
+      }
     },
     {
       "name": "ninja-debug-cuda",
