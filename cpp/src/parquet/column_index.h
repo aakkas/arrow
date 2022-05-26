@@ -15,8 +15,11 @@
 namespace parquet {
 
 class ColumnDescriptor;
+class Encryptor;
+class Decryptor;
+class WriterProperties;
 
-struct PageLocation {
+struct PARQUET_EXPORT PageLocation {
   /** Offset of the page in the file **/
   int64_t offset;
 
@@ -34,47 +37,102 @@ struct PageLocation {
   int64_t num_rows;
 };
 
+class PARQUET_EXPORT OffsetIndex {
+ public:
+  virtual ~OffsetIndex() {}
+
+  static std::shared_ptr<OffsetIndex> Deserialize(
+      int64_t total_num_rows, const Buffer& buffer,
+      std::shared_ptr<Decryptor> decryptor = NULLPTR);
+
+  virtual int64_t num_pages() const = 0;
+  virtual const std::vector<PageLocation>& page_locations() const = 0;
+};
+
 class PARQUET_EXPORT ColumnIndex {
  public:
   virtual ~ColumnIndex() {}
 
-  static std::shared_ptr<ColumnIndex> Make(
-      const ColumnDescriptor* descr, const BoundaryOrder::type boundary_order,
-      std::vector<bool> null_pages, std::vector<std::string> encoded_min_values,
-      std::vector<std::string> encoded_max_values,
-      std::vector<PageLocation> page_locations,
-      ::arrow::util::optional<std::vector<int64_t>> null_counts = ::arrow::util::nullopt,
-      ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
+  static std::shared_ptr<ColumnIndex> Deserialize(
+      const ColumnDescriptor* descr, const Buffer& buffer,
+      std::shared_ptr<Decryptor> decryptor = NULLPTR);
 
   /// \brief The full type descriptor from the column schema
   virtual const ColumnDescriptor* descr() const = 0;
 
-  /// \brief The physical type of the column schema
-  virtual Type::type physical_type() const = 0;
+  virtual BoundaryOrder::type boundary_order() const = 0;
 
   virtual int64_t num_pages() const = 0;
+
+  virtual std::shared_ptr<Statistics> PageStatistics(
+      int64_t page, int64_t num_rows) const = 0;
 };
 
 template <typename DType>
-class TypedColumnIndex : public ColumnIndex {
+class PARQUET_EXPORT TypedColumnIndex : public ColumnIndex {
  public:
   using T = typename DType::c_type;
 
-  virtual std::shared_ptr<TypedStatistics<DType>> PageStatistics(int64_t page) const = 0;
+  virtual std::shared_ptr<TypedStatistics<DType>> TypedPageStatistics(
+      int64_t page, int64_t num_rows) const = 0;
 };
 
-/// \brief Typed version of ColumnIndex::Make
-template <typename DType>
-std::shared_ptr<TypedColumnIndex<DType>> MakeColumnIndex(
-    const ColumnDescriptor* descr, const BoundaryOrder::type boundary_order,
-    std::vector<bool> null_pages, std::vector<std::string> encoded_min_values,
-    std::vector<std::string> encoded_max_values, std::vector<PageLocation> page_locations,
-    ::arrow::util::optional<std::vector<int64_t>> null_counts = ::arrow::util::nullopt,
-    ::arrow::MemoryPool* pool = ::arrow::default_memory_pool()) {
-  return std::static_pointer_cast<TypedColumnIndex<DType>>(ColumnIndex::Make(
-      descr, boundary_order, std::move(null_pages), std::move(encoded_min_values),
-      std::move(encoded_max_values), std::move(page_locations), std::move(null_counts),
-      std::move(pool)));
-}
+struct IndexLocation {
+  int64_t offset;
+  int32_t length;
+};
+
+class PARQUET_EXPORT IndexBuilder {
+ public:
+  virtual ~IndexBuilder() {}
+
+  virtual void Finish() = 0;
+
+  virtual IndexLocation WriteTo(::arrow::io::OutputStream* dst) const = 0;
+
+  virtual int16_t row_group_ordinal() const = 0;
+  virtual int16_t column_ordinal() const = 0;
+};
+
+class PARQUET_EXPORT OffsetIndexBuilder : public IndexBuilder {
+ public:
+  virtual ~OffsetIndexBuilder() {}
+
+  virtual void AddPageOffsetInfo(int64_t offset, int32_t compressed_page_size,
+                                 int64_t first_row_index) = 0;
+};
+
+class PARQUET_EXPORT ColumnIndexBuilder : public IndexBuilder {
+ public:
+  virtual ~ColumnIndexBuilder() {}
+
+  virtual void AddPageStatistics(const EncodedStatistics& stats, bool ascending,
+                                 bool descending) = 0;
+};
+
+class PARQUET_EXPORT RowGroupIndexBuilder {
+ public:
+  virtual ~RowGroupIndexBuilder() {}
+  virtual ColumnIndexBuilder* ColumnIndex(
+      const ColumnDescriptor* descr, int16_t column_ordinal,
+      std::shared_ptr<Encryptor> encryptor = NULLPTR) = 0;
+  virtual OffsetIndexBuilder* OffsetIndex(
+      const ColumnDescriptor* descr, int16_t column_ordinal,
+      std::shared_ptr<Encryptor> encryptor = NULLPTR) = 0;
+
+  virtual std::vector<ColumnIndexBuilder*> ColumnIndexes() = 0;
+  virtual std::vector<OffsetIndexBuilder*> OffsetIndexes() = 0;
+};
+
+class PARQUET_EXPORT FileIndexBuilder {
+ public:
+  virtual ~FileIndexBuilder() {}
+
+  static std::unique_ptr<FileIndexBuilder> Make(std::shared_ptr<WriterProperties> props);
+
+  virtual RowGroupIndexBuilder* AppendRowGroup() = 0;
+
+  virtual std::vector<RowGroupIndexBuilder*> RowGroups() = 0;
+};
 
 }  // namespace parquet

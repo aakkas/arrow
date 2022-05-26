@@ -23,6 +23,8 @@
 #include <utility>
 #include <vector>
 
+#include "arrow/util/logging.h"
+#include "parquet/column_index.h"
 #include "parquet/column_writer.h"
 #include "parquet/encryption/encryption_internal.h"
 #include "parquet/encryption/internal_file_encryptor.h"
@@ -80,11 +82,13 @@ inline void ThrowRowsMisMatchError(int col, int64_t prev, int64_t curr) {
 class RowGroupSerializer : public RowGroupWriter::Contents {
  public:
   RowGroupSerializer(std::shared_ptr<ArrowOutputStream> sink,
-                     RowGroupMetaDataBuilder* metadata, int16_t row_group_ordinal,
+                     RowGroupMetaDataBuilder* metadata,
+                     RowGroupIndexBuilder* rg_index_builder, int16_t row_group_ordinal,
                      const WriterProperties* properties, bool buffered_row_group = false,
                      InternalFileEncryptor* file_encryptor = nullptr)
       : sink_(std::move(sink)),
         metadata_(metadata),
+        rg_index_builder_(rg_index_builder),
         properties_(properties),
         total_bytes_written_(0),
         closed_(false),
@@ -108,6 +112,37 @@ class RowGroupSerializer : public RowGroupWriter::Contents {
     return num_rows_;
   }
 
+  std::shared_ptr<ColumnWriter> NextColumnWriter(bool buffered_row_group = false) {
+    // Throws an error if more columns are being written
+    auto col_meta = metadata_->NextColumnChunk();
+
+    const auto& path = col_meta->descr()->path();
+    auto meta_encryptor =
+        file_encryptor_ ? file_encryptor_->GetColumnMetaEncryptor(path->ToDotString())
+                        : nullptr;
+    auto data_encryptor =
+        file_encryptor_ ? file_encryptor_->GetColumnDataEncryptor(path->ToDotString())
+                        : nullptr;
+
+    int16_t column_ordinal = static_cast<int16_t>(next_column_index_++);
+
+    ColumnIndexBuilder* cib = nullptr;
+    OffsetIndexBuilder* oib = nullptr;  // TODO: implement
+    if (rg_index_builder_ && properties_->column_index_enabled(path)) {
+      cib = rg_index_builder_->ColumnIndex(col_meta->descr(), column_ordinal,
+                                           meta_encryptor);
+      oib = rg_index_builder_->OffsetIndex(col_meta->descr(), column_ordinal,
+                                           meta_encryptor);
+    }
+
+    std::unique_ptr<PageWriter> pager = PageWriter::Open(
+        sink_, properties_->compression(path), properties_->compression_level(path),
+        col_meta, row_group_ordinal_, column_ordinal, properties_->memory_pool(),
+        buffered_row_group, meta_encryptor, data_encryptor, cib, oib);
+
+    return ColumnWriter::Make(col_meta, std::move(pager), properties_, cib);
+  }
+
   ColumnWriter* NextColumn() override {
     if (buffered_row_group_) {
       throw ParquetException(
@@ -119,26 +154,13 @@ class RowGroupSerializer : public RowGroupWriter::Contents {
     }
 
     // Throws an error if more columns are being written
-    auto col_meta = metadata_->NextColumnChunk();
+    auto writer = NextColumnWriter(false);
 
     if (column_writers_[0]) {
       total_bytes_written_ += column_writers_[0]->Close();
     }
 
-    ++next_column_index_;
-
-    const auto& path = col_meta->descr()->path();
-    auto meta_encryptor =
-        file_encryptor_ ? file_encryptor_->GetColumnMetaEncryptor(path->ToDotString())
-                        : nullptr;
-    auto data_encryptor =
-        file_encryptor_ ? file_encryptor_->GetColumnDataEncryptor(path->ToDotString())
-                        : nullptr;
-    std::unique_ptr<PageWriter> pager = PageWriter::Open(
-        sink_, properties_->compression(path), properties_->compression_level(path),
-        col_meta, row_group_ordinal_, static_cast<int16_t>(next_column_index_ - 1),
-        properties_->memory_pool(), false, meta_encryptor, data_encryptor);
-    column_writers_[0] = ColumnWriter::Make(col_meta, std::move(pager), properties_);
+    column_writers_[0] = std::move(writer);
     return column_writers_[0].get();
   }
 
@@ -199,6 +221,7 @@ class RowGroupSerializer : public RowGroupWriter::Contents {
  private:
   std::shared_ptr<ArrowOutputStream> sink_;
   mutable RowGroupMetaDataBuilder* metadata_;
+  RowGroupIndexBuilder* rg_index_builder_;
   const WriterProperties* properties_;
   int64_t total_bytes_written_;
   bool closed_;
@@ -232,21 +255,7 @@ class RowGroupSerializer : public RowGroupWriter::Contents {
 
   void InitColumns() {
     for (int i = 0; i < num_columns(); i++) {
-      auto col_meta = metadata_->NextColumnChunk();
-      const auto& path = col_meta->descr()->path();
-      auto meta_encryptor =
-          file_encryptor_ ? file_encryptor_->GetColumnMetaEncryptor(path->ToDotString())
-                          : nullptr;
-      auto data_encryptor =
-          file_encryptor_ ? file_encryptor_->GetColumnDataEncryptor(path->ToDotString())
-                          : nullptr;
-      std::unique_ptr<PageWriter> pager = PageWriter::Open(
-          sink_, properties_->compression(path), properties_->compression_level(path),
-          col_meta, static_cast<int16_t>(row_group_ordinal_),
-          static_cast<int16_t>(next_column_index_++), properties_->memory_pool(),
-          buffered_row_group_, meta_encryptor, data_encryptor);
-      column_writers_.push_back(
-          ColumnWriter::Make(col_meta, std::move(pager), properties_));
+      column_writers_.push_back(NextColumnWriter(buffered_row_group_));
     }
   }
 
@@ -311,9 +320,15 @@ class FileSerializer : public ParquetFileWriter::Contents {
     }
     num_row_groups_++;
     auto rg_metadata = metadata_->AppendRowGroup();
+
+    RowGroupIndexBuilder* rg_cib = nullptr;
+    if (file_index_builder_) {
+      rg_cib = file_index_builder_->AppendRowGroup();
+    }
+
     std::unique_ptr<RowGroupWriter::Contents> contents(new RowGroupSerializer(
-        sink_, rg_metadata, static_cast<int16_t>(num_row_groups_ - 1), properties_.get(),
-        buffered_row_group, file_encryptor_.get()));
+        sink_, rg_metadata, rg_cib, static_cast<int16_t>(num_row_groups_ - 1),
+        properties_.get(), buffered_row_group, file_encryptor_.get()));
     row_group_writer_.reset(new RowGroupWriter(std::move(contents)));
     return row_group_writer_.get();
   }
@@ -340,8 +355,10 @@ class FileSerializer : public ParquetFileWriter::Contents {
         properties_(std::move(properties)),
         num_row_groups_(0),
         num_rows_(0),
-        metadata_(FileMetaDataBuilder::Make(&schema_, properties_, key_value_metadata_)) {
+        metadata_(FileMetaDataBuilder::Make(&schema_, properties_, key_value_metadata_)),
+        file_index_builder_(FileIndexBuilder::Make(properties_)) {
     PARQUET_ASSIGN_OR_THROW(int64_t position, sink_->Tell());
+
     if (position == 0) {
       StartFile();
     } else {
@@ -378,12 +395,35 @@ class FileSerializer : public ParquetFileWriter::Contents {
     }
   }
 
+  void WriteIndexes() {
+    for (const auto& rg_ib : file_index_builder_->RowGroups()) {
+      auto column_indexes = rg_ib->ColumnIndexes();
+      auto offset_indexes = rg_ib->OffsetIndexes();
+
+      DCHECK_EQ(column_indexes.size(), offset_indexes.size());
+
+      for (size_t i = 0; i < column_indexes.size(); i++) {
+        auto ci = column_indexes[i];
+        auto ci_loc = ci->WriteTo(sink_.get());
+        metadata_->SetColumnIndexLocation(ci->row_group_ordinal(), ci->column_ordinal(),
+                                          ci_loc);
+
+        auto oi = offset_indexes[i];
+        auto oi_loc = oi->WriteTo(sink_.get());
+        metadata_->SetOffsetIndexLocation(oi->row_group_ordinal(), oi->column_ordinal(),
+                                          oi_loc);
+      }
+    }
+  }
+
   std::shared_ptr<ArrowOutputStream> sink_;
   bool is_open_;
   const std::shared_ptr<WriterProperties> properties_;
   int num_row_groups_;
   int64_t num_rows_;
   std::unique_ptr<FileMetaDataBuilder> metadata_;
+  std::unique_ptr<FileIndexBuilder> file_index_builder_;
+
   // Only one of the row group writers is active at a time
   std::unique_ptr<RowGroupWriter> row_group_writer_;
 

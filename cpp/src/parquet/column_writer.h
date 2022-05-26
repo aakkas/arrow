@@ -46,6 +46,8 @@ class ColumnDescriptor;
 class DataPage;
 class DictionaryPage;
 class ColumnChunkMetaDataBuilder;
+class ColumnIndexBuilder;
+class OffsetIndexBuilder;
 class Encryptor;
 class WriterProperties;
 
@@ -90,7 +92,9 @@ class PARQUET_EXPORT PageWriter {
       ::arrow::MemoryPool* pool = ::arrow::default_memory_pool(),
       bool buffered_row_group = false,
       std::shared_ptr<Encryptor> header_encryptor = NULLPTR,
-      std::shared_ptr<Encryptor> data_encryptor = NULLPTR);
+      std::shared_ptr<Encryptor> data_encryptor = NULLPTR,
+      ColumnIndexBuilder* column_index_builder = nullptr,
+      OffsetIndexBuilder* offset_index_builder = nullptr);
 
   // The Column Writer decides if dictionary encoding is used if set and
   // if the dictionary encoding has fallen back to default encoding on reaching dictionary
@@ -98,7 +102,7 @@ class PARQUET_EXPORT PageWriter {
   virtual void Close(bool has_dictionary, bool fallback) = 0;
 
   // Return the number of uncompressed bytes written (including header size)
-  virtual int64_t WriteDataPage(const DataPage& page) = 0;
+  virtual int64_t WriteDataPage(const DataPage& page, int64_t first_row_index) = 0;
 
   // Return the number of uncompressed bytes written (including header size)
   virtual int64_t WriteDictionaryPage(const DictionaryPage& page) = 0;
@@ -115,7 +119,8 @@ class PARQUET_EXPORT ColumnWriter {
 
   static std::shared_ptr<ColumnWriter> Make(ColumnChunkMetaDataBuilder*,
                                             std::unique_ptr<PageWriter>,
-                                            const WriterProperties* properties);
+                                            const WriterProperties* properties,
+                                            ColumnIndexBuilder* = NULLPTR);
 
   /// \brief Closes the ColumnWriter, commits any buffered values to pages.
   /// \return Total size of the column in bytes

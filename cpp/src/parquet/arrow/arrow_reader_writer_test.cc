@@ -65,6 +65,7 @@
 #include "parquet/arrow/schema.h"
 #include "parquet/arrow/test_util.h"
 #include "parquet/arrow/writer.h"
+#include "parquet/column_index.h"
 #include "parquet/column_writer.h"
 #include "parquet/file_writer.h"
 #include "parquet/test_util.h"
@@ -4021,9 +4022,24 @@ TEST(TestArrowWriterAdHoc, SchemaMismatch) {
   ASSERT_RAISES(Invalid, writer->WriteTable(*tbl, 1));
 }
 
-class TestArrowWriteDictionary : public ::testing::TestWithParam<ParquetDataPageVersion> {
+struct ArrowWriteDictionaryParam {
+  ParquetDataPageVersion page_version;
+  bool enable_column_index;
+};
+
+std::string ArrowWriteDictionaryParamName(
+    const ::testing::TestParamInfo<ArrowWriteDictionaryParam>& info) {
+  std::stringstream name;
+  name << "page_ver_" << int(info.param.page_version) << "_column_index_"
+       << info.param.enable_column_index;
+  return name.str();
+}
+
+class TestArrowWriteDictionary
+    : public ::testing::TestWithParam<ArrowWriteDictionaryParam> {
  public:
-  ParquetDataPageVersion GetParquetDataPageVersion() { return GetParam(); }
+  ParquetDataPageVersion GetParquetDataPageVersion() { return GetParam().page_version; }
+  bool GetEnableColumnIndex() { return GetParam().enable_column_index; }
 };
 
 TEST_P(TestArrowWriteDictionary, Statistics) {
@@ -4049,6 +4065,8 @@ TEST_P(TestArrowWriteDictionary, Statistics) {
   // Pairs of (min, max)
   std::vector<std::vector<std::string>> expected_min_max_ = {
       {"a", "b"}, {"b", "c"}, {"a", "d"}, {"", ""}};
+  std::vector<std::vector<bool>> expected_has_min_max = {
+      {true, true}, {true, false}, {true, true}, {false}};
 
   for (std::size_t case_index = 0; case_index < test_dictionaries.size(); case_index++) {
     SCOPED_TRACE(test_dictionaries[case_index]->type()->ToString());
@@ -4061,13 +4079,19 @@ TEST_P(TestArrowWriteDictionary, Statistics) {
 
     std::shared_ptr<::arrow::ResizableBuffer> serialized_data = AllocateBuffer();
     auto out_stream = std::make_shared<::arrow::io::BufferOutputStream>(serialized_data);
-    std::shared_ptr<WriterProperties> writer_properties =
-        WriterProperties::Builder()
-            .max_row_group_length(3)
-            ->data_page_version(this->GetParquetDataPageVersion())
-            ->write_batch_size(2)
-            ->data_pagesize(2)
-            ->build();
+    auto prop_builder = WriterProperties::Builder()
+                            .max_row_group_length(3)
+                            ->data_page_version(this->GetParquetDataPageVersion())
+                            ->write_batch_size(2)
+                            ->data_pagesize(2);
+
+    if (this->GetEnableColumnIndex()) {
+      prop_builder->enable_column_index();
+    } else {
+      prop_builder->disable_column_index();
+    }
+
+    std::shared_ptr<WriterProperties> writer_properties = prop_builder->build();
     std::unique_ptr<FileWriter> writer;
     ASSERT_OK(FileWriter::Open(*schema, ::arrow::default_memory_pool(), out_stream,
                                writer_properties, default_arrow_writer_properties(),
@@ -4094,17 +4118,40 @@ TEST_P(TestArrowWriteDictionary, Statistics) {
       std::vector<std::string> case_expected_min_max = expected_min_max_[case_index];
       EXPECT_EQ(stats->EncodeMin(), case_expected_min_max[0]);
       EXPECT_EQ(stats->EncodeMax(), case_expected_min_max[1]);
+
+      EXPECT_EQ(metadata->RowGroup(row_group_index)->ColumnChunk(0)->has_column_index(),
+                this->GetEnableColumnIndex());
+      EXPECT_EQ(metadata->RowGroup(row_group_index)->ColumnChunk(0)->has_offset_index(),
+                this->GetEnableColumnIndex());
     }
 
     for (int row_group_index = 0; row_group_index < 2; row_group_index++) {
-      std::unique_ptr<PageReader> page_reader =
-          parquet_reader->RowGroup(row_group_index)->GetColumnPageReader(0);
+      auto rg_reader = parquet_reader->RowGroup(row_group_index);
+      auto column_index = rg_reader->ReadColumnIndex(0);
+      auto offset_index = rg_reader->ReadOffsetIndex(0);
+
+      if (this->GetEnableColumnIndex()) {
+        ASSERT_NE(column_index, nullptr);
+        ASSERT_EQ(column_index->num_pages(), expected_num_data_pages[case_index]);
+        ASSERT_NE(offset_index, nullptr);
+        ASSERT_EQ(offset_index->num_pages(), expected_num_data_pages[case_index]);
+      } else {
+        ASSERT_EQ(column_index, nullptr);
+        ASSERT_EQ(offset_index, nullptr);
+      }
+
+      std::unique_ptr<PageReader> page_reader = rg_reader->GetColumnPageReader(0);
       std::shared_ptr<Page> page = page_reader->NextPage();
       ASSERT_NE(page, nullptr);
       DictionaryPage* dict_page = (DictionaryPage*)page.get();
       ASSERT_EQ(dict_page->num_values(), expected_dict_counts[case_index]);
       for (int page_index = 0; page_index < expected_num_data_pages[case_index];
            page_index++) {
+        std::stringstream scope;
+        scope << "case: " << case_index << ", row_group:" << row_group_index
+              << ", page: " << page_index;
+        SCOPED_TRACE(scope.str());
+
         page = page_reader->NextPage();
         ASSERT_NE(page, nullptr);
         DataPage* data_page = (DataPage*)page.get();
@@ -4115,15 +4162,36 @@ TEST_P(TestArrowWriteDictionary, Statistics) {
         EXPECT_EQ(data_page->num_values(),
                   expected_valid_by_page[case_index][page_index] +
                       expected_null_by_page[case_index][page_index]);
+
+        if (this->GetEnableColumnIndex()) {
+          auto page_loc = offset_index->page_locations()[page_index];
+          EXPECT_EQ(data_page->num_values(), page_loc.num_rows);
+
+          auto page_stats = column_index->PageStatistics(page_index, page_loc.num_rows);
+          ASSERT_NE(page_stats, nullptr);
+          EXPECT_EQ(page_stats->null_count(),
+                    expected_null_by_page[case_index][page_index]);
+          EXPECT_EQ(page_stats->num_values(),
+                    expected_valid_by_page[case_index][page_index]);
+          EXPECT_EQ(page_stats->null_count() + page_stats->num_values(),
+                    page_loc.num_rows);
+          EXPECT_EQ(page_stats->HasMinMax(),
+                    expected_has_min_max[case_index][page_index]);
+          EXPECT_EQ(page_stats->HasDistinctCount(), false);
+        }
       }
       ASSERT_EQ(page_reader->NextPage(), nullptr);
     }
   }
 }
 
-INSTANTIATE_TEST_SUITE_P(WriteDictionary, TestArrowWriteDictionary,
-                         ::testing::Values(ParquetDataPageVersion::V1,
-                                           ParquetDataPageVersion::V2));
+INSTANTIATE_TEST_SUITE_P(
+    WriteDictionary, TestArrowWriteDictionary,
+    ::testing::Values(ArrowWriteDictionaryParam{ParquetDataPageVersion::V1, false},
+                      ArrowWriteDictionaryParam{ParquetDataPageVersion::V1, true},
+                      ArrowWriteDictionaryParam{ParquetDataPageVersion::V2, false},
+                      ArrowWriteDictionaryParam{ParquetDataPageVersion::V2, true}),
+    ArrowWriteDictionaryParamName);
 // ----------------------------------------------------------------------
 // Tests for directly reading DictionaryArray
 
