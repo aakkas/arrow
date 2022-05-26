@@ -470,8 +470,6 @@ class TypedStatisticsImpl : public TypedStatistics<DType> {
     auto comp = Comparator::Make(descr);
     comparator_ = std::static_pointer_cast<TypedComparator<DType>>(comp);
     Reset();
-    has_null_count_ = true;
-    has_distinct_count_ = true;
   }
 
   TypedStatisticsImpl(const T& min, const T& max, int64_t num_values, int64_t null_count,
@@ -494,7 +492,7 @@ class TypedStatisticsImpl : public TypedStatistics<DType> {
                       bool has_null_count, bool has_distinct_count, MemoryPool* pool)
       : TypedStatisticsImpl(descr, pool) {
     IncrementNumValues(num_values);
-    if (has_null_count_) {
+    if (has_null_count) {
       IncrementNullCount(null_count);
     }
     if (has_distinct_count) {
@@ -549,10 +547,10 @@ class TypedStatisticsImpl : public TypedStatistics<DType> {
   void Merge(const TypedStatistics<DType>& other) override {
     this->num_values_ += other.num_values();
     if (other.HasNullCount()) {
-      this->statistics_.null_count += other.null_count();
+      IncrementNullCount(other.null_count());
     }
     if (other.HasDistinctCount()) {
-      this->statistics_.distinct_count += other.distinct_count();
+      IncrementDistinctCount(other.distinct_count());
     }
     if (other.HasMinMax()) {
       SetMinMax(other.min(), other.max());
