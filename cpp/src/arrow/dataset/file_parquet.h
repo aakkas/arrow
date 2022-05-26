@@ -217,6 +217,9 @@ class ARROW_DS_EXPORT ParquetFileFragment : public FileFragment {
   /// simplified against the partition expression already.
   Result<util::optional<int64_t>> TryCountRows(compute::Expression predicate);
 
+  Result<compute::Expression> SimplifyPredicate(
+      compute::Expression predicate);
+
   /// Indices of row groups selected by this fragment,
   /// or util::nullopt if all row groups are selected.
   util::optional<std::vector<int>> row_groups_;
@@ -371,7 +374,7 @@ class ARROW_DS_EXPORT ParquetDatasetFactory : public DatasetFactory {
       std::shared_ptr<Schema> physical_schema, std::string base_path,
       ParquetFactoryOptions options,
       std::vector<std::pair<std::string, std::vector<int>>> paths_with_row_group_ids,
-      FileSource metadata_source)
+      std::shared_ptr<ParquetColumnIndexProvider> column_index_provider)
       : filesystem_(std::move(filesystem)),
         format_(std::move(format)),
         metadata_(std::move(metadata)),
@@ -380,7 +383,7 @@ class ARROW_DS_EXPORT ParquetDatasetFactory : public DatasetFactory {
         base_path_(std::move(base_path)),
         options_(std::move(options)),
         paths_with_row_group_ids_(std::move(paths_with_row_group_ids)),
-        metadata_source_(std::move(metadata_source)) {}
+        column_index_provider_(std::move(column_index_provider)) {}
 
   std::shared_ptr<fs::FileSystem> filesystem_;
   std::shared_ptr<ParquetFileFormat> format_;
@@ -390,7 +393,7 @@ class ARROW_DS_EXPORT ParquetDatasetFactory : public DatasetFactory {
   std::string base_path_;
   ParquetFactoryOptions options_;
   std::vector<std::pair<std::string, std::vector<int>>> paths_with_row_group_ids_;
-  FileSource metadata_source_;
+  std::shared_ptr<ParquetColumnIndexProvider> column_index_provider_;
 
  private:
   Result<std::vector<std::shared_ptr<FileFragment>>> CollectParquetFragments(

@@ -25,9 +25,12 @@
 #include <vector>
 
 #include "arrow/compute/exec.h"
+#include "arrow/compute/exec/expression_internal.h"
+#include "arrow/compute/exec_internal.h"
 #include "arrow/dataset/dataset_internal.h"
 #include "arrow/dataset/scanner.h"
 #include "arrow/filesystem/path_util.h"
+#include "arrow/scalar.h"
 #include "arrow/table.h"
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/future.h"
@@ -35,10 +38,13 @@
 #include "arrow/util/logging.h"
 #include "arrow/util/mutex.h"
 #include "arrow/util/range.h"
+#include "arrow/util/row_ranges.h"
 #include "arrow/util/tracing_internal.h"
+#include "arrow/util/variant.h"
 #include "parquet/arrow/reader.h"
 #include "parquet/arrow/schema.h"
 #include "parquet/arrow/writer.h"
+#include "parquet/column_index.h"
 #include "parquet/file_reader.h"
 #include "parquet/properties.h"
 #include "parquet/statistics.h"
@@ -95,20 +101,14 @@ Result<std::shared_ptr<SchemaManifest>> GetSchemaManifest(
   return manifest;
 }
 
-util::optional<compute::Expression> ColumnChunkStatisticsAsExpression(
-    const SchemaField& schema_field, const parquet::RowGroupMetaData& metadata) {
-  // For the remaining of this function, failure to extract/parse statistics
-  // are ignored by returning nullptr. The goal is two fold. First
-  // avoid an optimization which breaks the computation. Second, allow the
-  // following columns to maybe succeed in extracting column statistics.
-
+util::optional<compute::Expression> StatisticsAsExpression(
+    const SchemaField& schema_field,
+    const std::shared_ptr<parquet::Statistics>& statistics) {
   // For now, only leaf (primitive) types are supported.
   if (!schema_field.is_leaf()) {
     return util::nullopt;
   }
 
-  auto column_metadata = metadata.ColumnChunk(schema_field.column_index);
-  auto statistics = column_metadata->statistics();
   if (statistics == nullptr) {
     return util::nullopt;
   }
@@ -153,6 +153,22 @@ util::optional<compute::Expression> ColumnChunkStatisticsAsExpression(
   }
 
   return util::nullopt;
+}
+
+util::optional<compute::Expression> ColumnChunkStatisticsAsExpression(
+    const SchemaField& schema_field, const parquet::RowGroupMetaData& metadata) {
+  // For the remaining of this function, failure to extract/parse statistics
+  // are ignored by returning nullptr. The goal is two fold. First
+  // avoid an optimization which breaks the computation. Second, allow the
+  // following columns to maybe succeed in extracting column statistics.
+
+  // For now, only leaf (primitive) types are supported.
+  if (!schema_field.is_leaf()) {
+    return util::nullopt;
+  }
+
+  auto column_metadata = metadata.ColumnChunk(schema_field.column_index);
+  return StatisticsAsExpression(schema_field, column_metadata->statistics());
 }
 
 void AddColumnIndices(const SchemaField& schema_field,
@@ -283,10 +299,29 @@ Result<std::vector<int>> InferColumnProjection(const parquet::arrow::FileReader&
 
 // Compute the column projection based on the scan options
 Result<std::vector<int>> InferColumnProjection(
-    const parquet::arrow::SchemaManifest& manifest,
-    const compute::Expression& predicate) {
+    const Schema& physical_schema, const parquet::arrow::SchemaManifest& manifest,
+    const compute::Expression& predicate, const bool only_leafs = false) {
   // Checks if the field is needed in either the projection or the filter.
-  return InferColumnProjection(manifest, FieldsInExpression(predicate));
+
+  auto field_refs = FieldsInExpression(predicate);
+  if (only_leafs) {
+    std::vector<int> result;
+    std::unordered_set<int> visited;
+    for (const auto& field_ref : field_refs) {
+      ARROW_ASSIGN_OR_RAISE(auto match, field_ref.FindOneOrNone(physical_schema));
+      if (visited.insert(match[0]).second) {
+        const SchemaField& schema_field = manifest.schema_fields[match[0]];
+
+        if (schema_field.is_leaf()) {
+          result.push_back(schema_field.column_index);
+        }
+      }
+    }
+
+    return result;
+  }
+
+  return InferColumnProjection(manifest, field_refs);
 }
 
 Status WrapSourceError(const Status& status, const std::string& path) {
@@ -316,6 +351,19 @@ Result<bool> IsSupportedParquetFile(const ParquetFileFormat& format,
 
 }  // namespace
 
+bool IsLogicalFunction(const std::string& function_name) {
+  static std::unordered_set<std::string> logical_functions{
+      "and", "and_not", "and_kleene", "and_not_kleene", "or", "or_kleene", "xor"};
+
+  auto it = logical_functions.find(function_name);
+  return it != logical_functions.end();
+}
+
+struct MissingColumnIndex {};
+
+using RowRangeCalcResult = util::Variant<std::shared_ptr<parquet::ColumnIndex>,
+                                         MissingColumnIndex, util::RowRanges, Datum>;
+
 //
 // ParquetColumnIndexProvider
 //
@@ -325,19 +373,22 @@ class ParquetColumnIndexProviderImpl : public ParquetColumnIndexProvider {
   ParquetColumnIndexProviderImpl(std::shared_ptr<ParquetFileFormat> parquet_format,
                                  FileSource metadata_source,
                                  std::shared_ptr<parquet::FileMetaData> metadata,
+                                 std::shared_ptr<Schema> physical_schema,
                                  std::shared_ptr<parquet::arrow::SchemaManifest> manifest)
       : parquet_format_(std::move(parquet_format)),
         metadata_source_(std::move(metadata_source)),
         metadata_(std::move(metadata)),
+        physical_schema_(std::move(physical_schema)),
         manifest_(std::move(manifest)) {}
 
   static std::shared_ptr<ParquetColumnIndexProvider> Make(
       std::shared_ptr<ParquetFileFormat> parquet_format, FileSource metadata_source,
       std::shared_ptr<parquet::FileMetaData> metadata,
+      std::shared_ptr<Schema> physical_schema,
       std::shared_ptr<parquet::arrow::SchemaManifest> manifest) {
     return std::make_shared<ParquetColumnIndexProviderImpl>(
         std::move(parquet_format), std::move(metadata_source), std::move(metadata),
-        std::move(manifest));
+        std::move(physical_schema), std::move(manifest));
   }
 
   std::shared_ptr<parquet::ColumnIndex> GetColumnIndex(int row_group,
@@ -352,7 +403,9 @@ class ParquetColumnIndexProviderImpl : public ParquetColumnIndexProvider {
       return true;
     }
 
-    ARROW_ASSIGN_OR_RAISE(auto columns, InferColumnProjection(*manifest_, predicate));
+    ARROW_ASSIGN_OR_RAISE(auto columns,
+                          InferColumnProjection(*physical_schema_, *manifest_, predicate,
+                                                /*only_leafs*/ true));
 
     return HasColumnIndexes(columns, row_groups);
   }
@@ -379,7 +432,9 @@ class ParquetColumnIndexProviderImpl : public ParquetColumnIndexProvider {
       return Status::OK();
     }
 
-    ARROW_ASSIGN_OR_RAISE(auto columns, InferColumnProjection(*manifest_, predicate));
+    ARROW_ASSIGN_OR_RAISE(auto columns,
+                          InferColumnProjection(*physical_schema_, *manifest_, predicate,
+                                                /*only_leafs*/ true));
 
     return EnsureCompleteColumnIndexes(columns, row_groups);
   }
@@ -402,8 +457,8 @@ class ParquetColumnIndexProviderImpl : public ParquetColumnIndexProvider {
   }
 
  private:
-  const std::shared_ptr<parquet::ColumnIndex> GetColumnIndex_(int row_group,
-                                                              int column) const {
+  const std::shared_ptr<parquet::ColumnIndex> GetColumnIndex_(const int row_group,
+                                                              const int column) const {
     const auto& it_rg = column_indexes_.find(row_group);
     if (it_rg != column_indexes_.end()) {
       const auto& it_c = it_rg->second.find(column);
@@ -441,13 +496,174 @@ class ParquetColumnIndexProviderImpl : public ParquetColumnIndexProvider {
     }
   }
 
+  inline Result<const SchemaField*> GetSchemaField(const FieldRef& field_ref) {
+    ARROW_ASSIGN_OR_RAISE(auto field_path, field_ref.FindOneOrNone(*physical_schema_));
+    if (field_path.empty()) {
+      return Status::Invalid("Could not find schema field for ", field_ref.ToString());
+    }
+
+    return &manifest_->schema_fields[field_path[0]];
+  }
+
+  Result<RowRangeCalcResult> GetRowRanges(const compute::Expression& expr,
+                                          const int row_group, const int64_t row_count,
+                                          compute::ExecContext* exec_context) {
+    if (exec_context == nullptr) {
+      compute::ExecContext exec_context;
+      return GetRowRanges(expr, row_group, row_count, &exec_context);
+    }
+
+    if (!expr.IsBound()) {
+      return Status::Invalid("Cannot Execute unbound expression.");
+    }
+
+    if (!expr.IsScalarExpression()) {
+      return Status::Invalid(
+          "ExecuteScalarExpression cannot Execute non-scalar expression ",
+          expr.ToString());
+    }
+
+    if (auto lit = expr.literal()) return RowRangeCalcResult(*lit);
+
+    if (auto param = expr.parameter()) {
+      if (param->descr.type->id() == Type::NA) {
+        return RowRangeCalcResult(MissingColumnIndex());
+      }
+
+      auto field_ref = param->ref;
+      auto maybe_schema_field = GetSchemaField(field_ref);
+      if (!maybe_schema_field.ok() || !maybe_schema_field.ValueUnsafe()->is_leaf()) {
+        return RowRangeCalcResult(MissingColumnIndex());
+      }
+
+      auto column_index =
+          GetColumnIndex(row_group, maybe_schema_field.ValueUnsafe()->column_index);
+
+      if (!column_index) {
+        return RowRangeCalcResult(MissingColumnIndex());
+      }
+
+      return RowRangeCalcResult(column_index);
+    }
+
+    auto call = compute::CallNotNull(expr);
+
+    std::vector<RowRangeCalcResult> arguments(call->arguments.size());
+    bool all_datum = true;
+    for (size_t i = 0; i < arguments.size(); ++i) {
+      ARROW_ASSIGN_OR_RAISE(arguments[i], GetRowRanges(call->arguments[i], row_group,
+                                                       row_count, exec_context));
+      all_datum &= arguments[i].get<Datum>() != nullptr;
+    }
+
+    if (!all_datum) {
+      if (call->function_name == "invert") {
+        DCHECK_EQ(arguments.size(), 1);
+        if (auto ranges = arguments[0].get<util::RowRanges>()) {
+          return RowRangeCalcResult(ranges->Negate());
+        } else {
+          // Propagate
+          return arguments[0];
+        }
+      } else if (call->function_name == "is_null") {
+      } else if (IsLogicalFunction(call->function_name)) {
+      } else if (compute::Comparison::Get(call->function_name)) {
+      }
+    }
+
+    DCHECK(all_datum);
+    std::vector<Datum> datum_args;
+    datum_args.reserve(arguments.size());
+    for (size_t i = 0; i < arguments.size(); i++) {
+      datum_args[i] = std::move(*arguments[i].get<Datum>());
+    }
+
+    auto executor = compute::detail::KernelExecutor::MakeScalar();
+
+    compute::KernelContext kernel_context(exec_context);
+    kernel_context.SetState(call->kernel_state.get());
+
+    auto kernel = call->kernel;
+    auto descrs = compute::GetDescriptors(datum_args);
+    auto options = call->options.get();
+    RETURN_NOT_OK(executor->Init(&kernel_context, {kernel, descrs, options}));
+
+    compute::detail::DatumAccumulator listener;
+    RETURN_NOT_OK(executor->Execute(datum_args, &listener));
+    const auto out = executor->WrapResults(datum_args, listener.values());
+#ifndef NDEBUG
+    DCHECK_OK(executor->CheckResultType(out, call->function_name.c_str()));
+#endif
+    return RowRangeCalcResult(out);
+  }
+
   std::shared_ptr<ParquetFileFormat> parquet_format_;
   FileSource metadata_source_;
   std::shared_ptr<parquet::FileMetaData> metadata_;
+  std::shared_ptr<Schema> physical_schema_;
   std::shared_ptr<parquet::arrow::SchemaManifest> manifest_;
   std::unordered_map<int, std::unordered_map<int, std::shared_ptr<parquet::ColumnIndex>>>
       column_indexes_;
   mutable util::Mutex mutex_;
+};
+
+class ParquetColumnIndexProviderView : public ParquetColumnIndexProvider {
+ public:
+  ParquetColumnIndexProviderView(std::shared_ptr<ParquetColumnIndexProvider> provider,
+                                 std::vector<int> row_group_mapping)
+      : provider_(std::move(provider)),
+        row_group_mapping_(std::move(row_group_mapping)) {}
+
+  static std::shared_ptr<ParquetColumnIndexProvider> Make(
+      std::shared_ptr<ParquetColumnIndexProvider> provider,
+      std::vector<int> row_group_mapping) {
+    return std::make_shared<ParquetColumnIndexProviderView>(std::move(provider),
+                                                            std::move(row_group_mapping));
+  }
+
+  std::shared_ptr<parquet::ColumnIndex> GetColumnIndex(int row_group,
+                                                       int column) const override {
+    return provider_->GetColumnIndex(TranslateRowGroupId(row_group), column);
+  }
+
+  Result<bool> HasColumnIndexes(const compute::Expression& predicate,
+                                const std::vector<int>& row_groups) const override {
+    return provider_->HasColumnIndexes(predicate, TranslateRowGroupIds(row_groups));
+  }
+
+  bool HasColumnIndexes(const std::vector<int>& columns,
+                        const std::vector<int>& row_groups) const override {
+    return provider_->HasColumnIndexes(columns, TranslateRowGroupIds(row_groups));
+  }
+
+  const Status EnsureCompleteColumnIndexes(const compute::Expression& predicate,
+                                           const std::vector<int>& row_groups) override {
+    return provider_->EnsureCompleteColumnIndexes(predicate,
+                                                  TranslateRowGroupIds(row_groups));
+  }
+
+  const Status EnsureCompleteColumnIndexes(const std::vector<int>& columns,
+                                           const std::vector<int>& row_groups) override {
+    return provider_->EnsureCompleteColumnIndexes(columns,
+                                                  TranslateRowGroupIds(row_groups));
+  }
+
+ private:
+  inline int TranslateRowGroupId(const int row_group) const {
+    return row_group_mapping_[row_group];
+  }
+
+  std::vector<int> TranslateRowGroupIds(const std::vector<int>& row_groups) const {
+    std::vector<int> original_ids(row_groups.size());
+    for (size_t i = 0; i < row_groups.size(); i++) {
+      original_ids[i] = row_group_mapping_[row_groups[i]];
+    }
+
+    return original_ids;
+  }
+
+  std::shared_ptr<ParquetColumnIndexProvider> provider_;
+  std::vector<int> row_group_mapping_;
 };
 
 bool ParquetFileFormat::Equals(const FileFormat& other) const {
@@ -793,8 +1009,8 @@ Status ParquetFileFragment::EnsureCompleteMetadata(
       GetSchemaManifest(*reader->parquet_reader()->metadata(), reader->properties()));
   RETURN_NOT_OK(SetMetadata(reader->parquet_reader()->metadata(), std::move(manifest)));
 
-  column_index_provider_ = ParquetColumnIndexProviderImpl::Make(parquet_format(), source_,
-                                                                metadata_, manifest_);
+  column_index_provider_ = ParquetColumnIndexProviderImpl::Make(
+      parquet_format(), source_, metadata_, physical_schema_, manifest_);
   if (maybe_predicate.has_value() && row_groups_.has_value()) {
     RETURN_NOT_OK(column_index_provider_->EnsureCompleteColumnIndexes(
         maybe_predicate.value(), *row_groups_));
@@ -888,6 +1104,14 @@ Result<std::vector<int>> ParquetFileFragment::FilterRowGroups(
   return row_groups;
 }
 
+Result<compute::Expression> ParquetFileFragment::SimplifyPredicate(
+    compute::Expression predicate) {
+  ARROW_ASSIGN_OR_RAISE(
+      predicate, SimplifyWithGuarantee(std::move(predicate), partition_expression_));
+
+  return predicate;
+}
+
 Result<std::vector<compute::Expression>> ParquetFileFragment::TestRowGroups(
     compute::Expression predicate) {
   ARROW_ASSIGN_OR_RAISE(const auto has_complete_metadata, HasCompleteMetadata());
@@ -895,8 +1119,7 @@ Result<std::vector<compute::Expression>> ParquetFileFragment::TestRowGroups(
 
   auto lock = physical_schema_mutex_.Lock();
 
-  ARROW_ASSIGN_OR_RAISE(
-      predicate, SimplifyWithGuarantee(std::move(predicate), partition_expression_));
+  ARROW_ASSIGN_OR_RAISE(predicate, SimplifyPredicate(std::move(predicate)));
 
   if (!predicate.IsSatisfiable()) {
     return std::vector<compute::Expression>{};
@@ -910,6 +1133,7 @@ Result<std::vector<compute::Expression>> ParquetFileFragment::TestRowGroups(
     statistics_expressions_complete_[match[0]] = true;
 
     const SchemaField& schema_field = manifest_->schema_fields[match[0]];
+
     int i = 0;
     for (int row_group : *row_groups_) {
       auto row_group_metadata = metadata_->RowGroup(row_group);
@@ -1078,10 +1302,13 @@ Result<std::shared_ptr<DatasetFactory>> ParquetDatasetFactory::Make(
     paths_with_row_group_ids[inserted_index.first->second].second.push_back(i);
   }
 
+  auto column_index_provider = ParquetColumnIndexProviderImpl::Make(
+      format, metadata_source, metadata, physical_schema, manifest);
+
   return std::shared_ptr<DatasetFactory>(new ParquetDatasetFactory(
       std::move(filesystem), std::move(format), std::move(metadata), std::move(manifest),
       std::move(physical_schema), base_path, std::move(options),
-      std::move(paths_with_row_group_ids), metadata_source));
+      std::move(paths_with_row_group_ids), std::move(column_index_provider)));
 }
 
 Result<std::vector<std::shared_ptr<FileFragment>>>
@@ -1091,7 +1318,8 @@ ParquetDatasetFactory::CollectParquetFragments(const Partitioning& partitioning)
   size_t i = 0;
   for (const auto& e : paths_with_row_group_ids_) {
     const auto& path = e.first;
-    auto metadata_subset = metadata_->Subset(e.second);
+    const auto& original_row_group_ids = e.second;
+    auto metadata_subset = metadata_->Subset(original_row_group_ids);
 
     auto row_groups = Iota(metadata_subset->num_row_groups());
 
@@ -1099,14 +1327,12 @@ ParquetDatasetFactory::CollectParquetFragments(const Partitioning& partitioning)
         partitioning.Parse(StripPrefixAndFilename(path, options_.partition_base_dir))
             .ValueOr(compute::literal(true));
 
-    auto column_index_provider = ParquetColumnIndexProviderImpl::Make(
-        format_, metadata_source_, metadata_subset, manifest_);
-
     ARROW_ASSIGN_OR_RAISE(
         auto fragment,
         format_->MakeFragment({path, filesystem_}, std::move(partition_expression),
                               physical_schema_, std::move(row_groups),
-                              std::move(column_index_provider)));
+                              ParquetColumnIndexProviderView::Make(
+                                  column_index_provider_, original_row_group_ids)));
 
     RETURN_NOT_OK(fragment->SetMetadata(metadata_subset, manifest_));
     fragments[i++] = std::move(fragment);
