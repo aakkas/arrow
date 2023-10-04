@@ -229,8 +229,8 @@ class ColumnIndexBuilderImpl : public IndexBuilderImpl<ColumnIndexBuilder> {
     descending_ = descending_ && descending;
 
     if (stats.has_min) {
-      ci_.min_values.push_back(stats.min());
       DCHECK(stats.has_max);
+      ci_.min_values.push_back(stats.min());
       ci_.max_values.push_back(stats.max());
       ci_.null_pages.push_back(false);
     } else {

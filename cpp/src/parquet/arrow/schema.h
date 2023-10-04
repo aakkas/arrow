@@ -136,7 +136,7 @@ struct PARQUET_EXPORT SchemaManifest {
     return it->second;
   }
 
-  /// Coalesce a list of field indices (relative to the equivalent arrow::Schema) which
+  /// Coalesce a list of field indices (relative to the equivalent arrow::Schema) whi`ch
   /// correspond to the column root (first node below the parquet schema's root group) of
   /// each leaf referenced in column_indices.
   ///
@@ -176,6 +176,23 @@ struct PARQUET_EXPORT SchemaManifest {
         out.push_back(field_idx);
       }
     }
+    return out;
+  }
+
+  ::arrow::Result<const SchemaField*> Get(const ::arrow::FieldPath& path) {
+    const auto* children = &schema_fields;
+    int depth = 0;
+    const SchemaField* out;
+    for (int index : path.indices()) {
+      if (index < 0 || static_cast<size_t>(index) >= children->size()) {
+        return ::arrow::Status::IndexError(depth);
+      }
+
+      out = &children->at(index);
+      children = &out->children;
+      ++depth;
+    }
+
     return out;
   }
 };

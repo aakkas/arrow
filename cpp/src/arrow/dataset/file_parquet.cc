@@ -351,18 +351,303 @@ Result<bool> IsSupportedParquetFile(const ParquetFileFormat& format,
 
 }  // namespace
 
-bool IsLogicalFunction(const std::string& function_name) {
-  static std::unordered_set<std::string> logical_functions{
-      "and", "and_not", "and_kleene", "and_not_kleene", "or", "or_kleene", "xor"};
+class FilterResult {
+ public:
+  struct RangeResult {
+    util::RowRanges include;
+    util::RowRanges is_null;
 
-  auto it = logical_functions.find(function_name);
-  return it != logical_functions.end();
+    RangeResult() {}
+    RangeResult(util::RowRanges include) : include(std::move(include)) {}
+    RangeResult(util::RowRanges include, util::RowRanges is_null)
+        : include(std::move(include)), is_null(std::move(is_null)) {}
+
+    Result<RangeResult> Invert() const { return RangeResult{include.Invert(), is_null}; }
+
+    Result<RangeResult> IsNull() const { return RangeResult{is_null}; }
+
+    Result<RangeResult> IsValid() const { return is_null.Invert(); }
+
+    Result<RangeResult> TrueUnlessNull() const {
+      return RangeResult{is_null.Invert(), is_null.Invert()};
+    }
+
+    Result<RangeResult> And(const RangeResult& rhs) const {
+      return RangeResult{include.Intersect(rhs.include), is_null.Union(rhs.is_null)};
+    }
+
+    Result<RangeResult> AndKleene(const RangeResult& rhs) const {
+      ARROW_ASSIGN_OR_RAISE(auto lhs_valid, IsValid());
+      auto lhs_true = lhs_valid.include.Intersect(include);
+      auto lhs_false = lhs_valid.include.Intersect(include.Invert());
+
+      ARROW_ASSIGN_OR_RAISE(auto rhs_valid, rhs.IsValid());
+      auto rhs_true = rhs_valid.include.Intersect(rhs.include);
+      auto rhs_false = rhs_valid.include.Intersect(rhs.include.Invert());
+
+      auto result_include = lhs_true.Intersect(rhs_true);
+      auto result_is_null = lhs_false.Union(rhs_false).Union(result_include).Invert();
+      return RangeResult{std::move(result_include), std::move(result_is_null)};
+    }
+
+    Result<RangeResult> AndNot(const RangeResult& rhs) const {
+      ARROW_ASSIGN_OR_RAISE(auto not_rhs, rhs.Invert());
+      return And(not_rhs);
+    }
+
+    Result<RangeResult> AndNotKleene(const RangeResult& rhs) const {
+      ARROW_ASSIGN_OR_RAISE(auto not_rhs, rhs.Invert());
+      return AndKleene(not_rhs);
+    }
+
+    Result<RangeResult> Or(const RangeResult& rhs) const {
+      return RangeResult{include.Union(rhs.include), is_null.Union(rhs.is_null)};
+    }
+
+    Result<RangeResult> OrKleene(const RangeResult& rhs) const {
+      ARROW_ASSIGN_OR_RAISE(auto lhs_valid, IsValid());
+      auto lhs_true = lhs_valid.include.Intersect(include);
+      auto lhs_false = lhs_valid.include.Intersect(include.Invert());
+
+      ARROW_ASSIGN_OR_RAISE(auto rhs_valid, rhs.IsValid());
+      auto rhs_true = rhs_valid.include.Intersect(rhs.include);
+      auto rhs_false = rhs_valid.include.Intersect(rhs.include.Invert());
+
+      auto result_include = lhs_true.Union(rhs_true);
+      auto result_is_null = result_include.Union(lhs_false.Intersect(rhs_false)).Invert();
+
+      return RangeResult{std::move(result_include), std::move(result_is_null)};
+    }
+
+    Result<RangeResult> Xor(const RangeResult& rhs) const {
+      ARROW_ASSIGN_OR_RAISE(auto lhs_and_not_rhs, AndNot(rhs));
+      ARROW_ASSIGN_OR_RAISE(auto rhs_and_not_lhs, rhs.AndNot(*this));
+      return lhs_and_not_rhs.Or(rhs_and_not_lhs);
+    }
+
+    static const RangeResult& NONE() {
+      static RangeResult none;
+      return none;
+    }
+
+    static const RangeResult& ALL() {
+      static RangeResult all{util::RowRanges::ALL()};
+      return all;
+    }
+
+    static const RangeResult& ALL_NULLABLE() {
+      static RangeResult all_nullable{util::RowRanges::ALL(), util::RowRanges::ALL()};
+      return all_nullable;
+    }
+  };
+
+  struct DatumResult {
+    Datum datum;
+
+    Result<RangeResult> Truthy() const { return RangeResult::ALL(); }
+  };
+
+  struct ColumnResult {
+    Type::type type;
+    const SchemaField* schema_field;
+
+    Result<RangeResult> Truthy() const { return RangeResult::ALL(); }
+
+    Result<RangeResult> Compare(const DatumResult& datum,
+                                compute::Comparison::type cmp) const {
+      return RangeResult::ALL();
+    }
+  };
+
+  FilterResult() = default;
+  FilterResult(ColumnResult column) : impl_(std::make_shared<Impl>(std::move(column))) {}
+  FilterResult(RangeResult range) : impl_(std::make_shared<Impl>(std::move(range))) {}
+  FilterResult(DatumResult datum) : impl_(std::make_shared<Impl>(std::move(datum))) {}
+  FilterResult(Datum datum)
+      : impl_(std::make_shared<Impl>(DatumResult{std::move(datum)})) {}
+
+  const ColumnResult* column() const { return util::get_if<ColumnResult>(impl_.get()); }
+  const RangeResult* range() const { return util::get_if<RangeResult>(impl_.get()); }
+  const DatumResult* datum() const { return util::get_if<DatumResult>(impl_.get()); }
+
+  Result<RangeResult> Truthy() const {
+    if (auto r = range()) {
+      return *r;
+    } else if (auto d = datum()) {
+      return d->Truthy();
+    } else if (auto c = column()) {
+      return c->Truthy();
+    }
+
+    return Status::Invalid("Invalid FilterResult");
+  }
+
+  static Result<FilterResult> CallFunction(const std::string& function_name,
+                                           const std::vector<FilterResult>& arguments);
+
+  typedef Result<FilterResult> (*FilterFunction)(const std::vector<FilterResult>& args);
+  static FilterFunction GetFunction(const std::string& function_name);
+
+ private:
+  using Impl = util::Variant<ColumnResult, RangeResult, DatumResult>;
+  std::shared_ptr<Impl> impl_;
+};
+
+Result<FilterResult> FilterResult::CallFunction(
+    const std::string& function_name, const std::vector<FilterResult>& arguments) {
+  if (auto func = GetFunction(function_name)) {
+    return func(arguments);
+  }
+
+  return RangeResult::ALL();
 }
 
-struct MissingColumnIndex {};
+#define TRUTHY(lhs, args, idx)                                      \
+  if (idx >= args.size()) {                                         \
+    return Status::IndexError("Insufficient number of arguments."); \
+  }                                                                 \
+  ARROW_ASSIGN_OR_RAISE(lhs, args[idx].Truthy());
 
-using RowRangeCalcResult = util::Variant<std::shared_ptr<parquet::ColumnIndex>,
-                                         MissingColumnIndex, util::RowRanges, Datum>;
+static Result<FilterResult> Invert(const std::vector<FilterResult>& args) {
+  TRUTHY(const auto& truthy, args, 0);
+  return truthy.Invert();
+}
+
+static Result<FilterResult> IsNull(const std::vector<FilterResult>& args) {
+  TRUTHY(const auto& truthy, args, 0);
+  return truthy.IsNull();
+}
+
+static Result<FilterResult> IsValid(const std::vector<FilterResult>& args) {
+  TRUTHY(const auto& truthy, args, 0);
+  return truthy.IsValid();
+}
+
+static Result<FilterResult> TrueUnlessNull(const std::vector<FilterResult>& args) {
+  TRUTHY(const auto& truthy, args, 0);
+  return truthy.TrueUnlessNull();
+}
+
+static Result<FilterResult> And(const std::vector<FilterResult>& args) {
+  TRUTHY(const auto& lhs, args, 0);
+  TRUTHY(const auto& rhs, args, 1);
+  return lhs.And(rhs);
+}
+
+static Result<FilterResult> AndKleene(const std::vector<FilterResult>& args) {
+  TRUTHY(const auto& lhs, args, 0);
+  TRUTHY(const auto& rhs, args, 1);
+  return lhs.AndKleene(rhs);
+}
+
+static Result<FilterResult> AndNot(const std::vector<FilterResult>& args) {
+  TRUTHY(const auto& lhs, args, 0);
+  TRUTHY(const auto& rhs, args, 1);
+  return lhs.AndNot(rhs);
+}
+
+static Result<FilterResult> AndNotKleene(const std::vector<FilterResult>& args) {
+  TRUTHY(const auto& lhs, args, 0);
+  TRUTHY(const auto& rhs, args, 1);
+  return lhs.AndNotKleene(rhs);
+}
+
+static Result<FilterResult> Or(const std::vector<FilterResult>& args) {
+  TRUTHY(const auto& lhs, args, 0);
+  TRUTHY(const auto& rhs, args, 1);
+  return lhs.Or(rhs);
+}
+
+static Result<FilterResult> OrKleene(const std::vector<FilterResult>& args) {
+  TRUTHY(const auto& lhs, args, 0);
+  TRUTHY(const auto& rhs, args, 1);
+  return lhs.OrKleene(rhs);
+}
+
+static Result<FilterResult> Xor(const std::vector<FilterResult>& args) {
+  TRUTHY(const auto& lhs, args, 0);
+  TRUTHY(const auto& rhs, args, 1);
+  return lhs.Xor(rhs);
+}
+
+#undef TRUTHY
+
+static Result<FilterResult> Compare(const std::vector<FilterResult>& args,
+                                    const compute::Comparison::type cmp) {
+  if (args.size() < 2) {
+    return Status::IndexError("Insufficient number of arguments.");
+  }
+
+  const auto& lhs = args[0];
+  const auto& rhs = args[1];
+
+  if (auto c = lhs.column()) {
+    if (auto d = rhs.datum()) {
+      return c->Compare(*d, cmp);
+    }
+  } else if (auto d = lhs.datum()) {
+    if (auto c = rhs.column()) {
+      return c->Compare(*d, compute::Comparison::GetFlipped(cmp));
+    }
+  }
+
+  return FilterResult::RangeResult::ALL();
+}
+
+static Result<FilterResult> Equal(const std::vector<FilterResult>& args) {
+  return Compare(args, compute::Comparison::type::EQUAL);
+}
+
+static Result<FilterResult> NotEqual(const std::vector<FilterResult>& args) {
+  return Compare(args, compute::Comparison::type::NOT_EQUAL);
+}
+
+static Result<FilterResult> Less(const std::vector<FilterResult>& args) {
+  return Compare(args, compute::Comparison::type::LESS);
+}
+
+static Result<FilterResult> LessEqual(const std::vector<FilterResult>& args) {
+  return Compare(args, compute::Comparison::type::LESS_EQUAL);
+}
+
+static Result<FilterResult> Greater(const std::vector<FilterResult>& args) {
+  return Compare(args, compute::Comparison::type::GREATER);
+}
+
+static Result<FilterResult> GreaterEqual(const std::vector<FilterResult>& args) {
+  return Compare(args, compute::Comparison::type::GREATER_EQUAL);
+}
+
+FilterResult::FilterFunction FilterResult::GetFunction(const std::string& function_name) {
+  static std::unordered_map<std::string, FilterFunction> functions{
+      {"is_null", IsNull},
+      {"is_valid", IsValid},
+      {"true_unless_null", TrueUnlessNull},
+      // Logical
+      {"invert", Invert},
+      {"and", And},
+      {"and_kleene", AndKleene},
+      {"and_not", AndNot},
+      {"and_not_kleene", AndNotKleene},
+      {"or", Or},
+      {"or_kleene", OrKleene},
+      {"xor", Xor},
+      // Comparison
+      {"equal", Equal},
+      {"not_equal", NotEqual},
+      {"less", Less},
+      {"less_equal", LessEqual},
+      {"greater", Greater},
+      {"greater_equal", GreaterEqual},
+  };
+
+  auto it = functions.find(function_name);
+  if (it != functions.end()) {
+    return it->second;
+  }
+
+  return nullptr;
+}
 
 //
 // ParquetColumnIndexProvider
@@ -505,9 +790,9 @@ class ParquetColumnIndexProviderImpl : public ParquetColumnIndexProvider {
     return &manifest_->schema_fields[field_path[0]];
   }
 
-  Result<RowRangeCalcResult> GetRowRanges(const compute::Expression& expr,
-                                          const int row_group, const int64_t row_count,
-                                          compute::ExecContext* exec_context) {
+  Result<FilterResult> GetRowRanges(const compute::Expression& expr, const int row_group,
+                                    const int64_t row_count,
+                                    compute::ExecContext* exec_context) {
     if (exec_context == nullptr) {
       compute::ExecContext exec_context;
       return GetRowRanges(expr, row_group, row_count, &exec_context);
@@ -523,59 +808,38 @@ class ParquetColumnIndexProviderImpl : public ParquetColumnIndexProvider {
           expr.ToString());
     }
 
-    if (auto lit = expr.literal()) return RowRangeCalcResult(*lit);
+    if (auto lit = expr.literal()) {
+      return FilterResult::DatumResult{*lit};
+    }
 
     if (auto param = expr.parameter()) {
-      if (param->descr.type->id() == Type::NA) {
-        return RowRangeCalcResult(MissingColumnIndex());
-      }
+      const auto schema_field = manifest_
+                              ->Get(FieldPath(std::vector<int>(param->indices.begin(),
+                                                               param->indices.end())))
+                              .ValueOr(nullptr);
 
-      auto field_ref = param->ref;
-      auto maybe_schema_field = GetSchemaField(field_ref);
-      if (!maybe_schema_field.ok() || !maybe_schema_field.ValueUnsafe()->is_leaf()) {
-        return RowRangeCalcResult(MissingColumnIndex());
-      }
-
-      auto column_index =
-          GetColumnIndex(row_group, maybe_schema_field.ValueUnsafe()->column_index);
-
-      if (!column_index) {
-        return RowRangeCalcResult(MissingColumnIndex());
-      }
-
-      return RowRangeCalcResult(column_index);
+      return FilterResult::ColumnResult{param->descr.type->id(), schema_field};
     }
 
     auto call = compute::CallNotNull(expr);
 
-    std::vector<RowRangeCalcResult> arguments(call->arguments.size());
+    std::vector<FilterResult> arguments(call->arguments.size());
     bool all_datum = true;
     for (size_t i = 0; i < arguments.size(); ++i) {
       ARROW_ASSIGN_OR_RAISE(arguments[i], GetRowRanges(call->arguments[i], row_group,
                                                        row_count, exec_context));
-      all_datum &= arguments[i].get<Datum>() != nullptr;
+      all_datum = all_datum && arguments[i].datum() != nullptr;
     }
 
     if (!all_datum) {
-      if (call->function_name == "invert") {
-        DCHECK_EQ(arguments.size(), 1);
-        if (auto ranges = arguments[0].get<util::RowRanges>()) {
-          return RowRangeCalcResult(ranges->Negate());
-        } else {
-          // Propagate
-          return arguments[0];
-        }
-      } else if (call->function_name == "is_null") {
-      } else if (IsLogicalFunction(call->function_name)) {
-      } else if (compute::Comparison::Get(call->function_name)) {
-      }
+      return FilterResult::CallFunction(call->function_name, arguments);
     }
 
     DCHECK(all_datum);
     std::vector<Datum> datum_args;
     datum_args.reserve(arguments.size());
     for (size_t i = 0; i < arguments.size(); i++) {
-      datum_args[i] = std::move(*arguments[i].get<Datum>());
+      datum_args[i] = std::move(arguments[i].datum()->datum);
     }
 
     auto executor = compute::detail::KernelExecutor::MakeScalar();
@@ -594,7 +858,8 @@ class ParquetColumnIndexProviderImpl : public ParquetColumnIndexProvider {
 #ifndef NDEBUG
     DCHECK_OK(executor->CheckResultType(out, call->function_name.c_str()));
 #endif
-    return RowRangeCalcResult(out);
+
+    return out;
   }
 
   std::shared_ptr<ParquetFileFormat> parquet_format_;

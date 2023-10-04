@@ -236,30 +236,30 @@ TEST(RowRangeTests, Intersect_Complex) {
   EXPECT_EQ(ranges_a.Intersect(ranges_b).ranges(), ranges);
 }
 
-TEST(RowRangeTests, Negate) {
+TEST(RowRangeTests, Invert) {
   RowRanges non_partial{{false, 7, 15}};
   RowRanges partial{{true, 7, 15}};
-  // Non partial does not survive negate
-  EXPECT_EQ(non_partial.Negate().ranges(),
+  // Non partial does not survive Invert
+  EXPECT_EQ(non_partial.Invert().ranges(),
             RangeVector({{false, std::numeric_limits<int64_t>::min(), 7},
                          {false, 15, std::numeric_limits<int64_t>::max()}}));
 
-  // Partial survives negate
-  EXPECT_EQ(partial.Negate().ranges(),
+  // Partial survives Invert
+  EXPECT_EQ(partial.Invert().ranges(),
             RangeVector({{false, std::numeric_limits<int64_t>::min(), 7},
                          {true, 7, 15},
                          {false, 15, std::numeric_limits<int64_t>::max()}}));
 
   // Gap turns non partial.
   RowRanges gap({{false, 7, 15}, {false, 20, 25}});
-  EXPECT_EQ(gap.Negate().ranges(),
+  EXPECT_EQ(gap.Invert().ranges(),
             RangeVector({{false, std::numeric_limits<int64_t>::min(), 7},
                          {false, 15, 20},
                          {false, 25, std::numeric_limits<int64_t>::max()}}));
 
   RowRanges complex(
       {{true, 7, 15}, {false, 15, 25}, {true, 25, 30}, {true, 35, 40}, {false, 45, 50}});
-  EXPECT_EQ(complex.Negate().ranges(),
+  EXPECT_EQ(complex.Invert().ranges(),
             RangeVector({{false, std::numeric_limits<int64_t>::min(), 7},
                          {true, 7, 15},
                          {true, 25, 30},

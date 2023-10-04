@@ -154,7 +154,7 @@ RowRanges RowRanges::Intersect(const RowRanges& other) const {
   return RowRanges(std::move(result_ranges));
 }
 
-RowRanges RowRanges::Negate() const {
+RowRanges RowRanges::Invert() const {
   std::vector<RowRange> result_ranges;
   int64_t last = std::numeric_limits<int64_t>::min();
   for (const auto& range : ranges_) {
