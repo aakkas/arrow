@@ -40,6 +40,7 @@ class RowGroupMetaData;
 class FileMetaData;
 class FileDecryptionProperties;
 class FileEncryptionProperties;
+class ColumnIndex;
 
 class ReaderProperties;
 class ArrowReaderProperties;
@@ -62,6 +63,26 @@ namespace dataset {
 /// @{
 
 constexpr char kParquetTypeName[] = "parquet";
+
+class ARROW_DS_EXPORT ParquetColumnIndexProvider {
+ public:
+  virtual ~ParquetColumnIndexProvider() {}
+
+  virtual std::shared_ptr<parquet::ColumnIndex> GetColumnIndex(int row_group,
+                                                               int column) const = 0;
+
+  virtual Result<bool> HasColumnIndexes(const compute::Expression& predicate,
+                                        const std::vector<int>& row_groups) const = 0;
+
+  virtual bool HasColumnIndexes(const std::vector<int>& columns,
+                                const std::vector<int>& row_groups) const = 0;
+
+  virtual const Status EnsureCompleteColumnIndexes(
+      const compute::Expression& predicate, const std::vector<int>& row_groups) = 0;
+
+  virtual const Status EnsureCompleteColumnIndexes(
+      const std::vector<int>& columns, const std::vector<int>& row_groups) = 0;
+};
 
 /// \brief A FileFormat implementation that reads from Parquet files
 class ARROW_DS_EXPORT ParquetFileFormat : public FileFormat {
@@ -113,7 +134,8 @@ class ARROW_DS_EXPORT ParquetFileFormat : public FileFormat {
   /// \brief Create a Fragment, restricted to the specified row groups.
   Result<std::shared_ptr<ParquetFileFragment>> MakeFragment(
       FileSource source, compute::Expression partition_expression,
-      std::shared_ptr<Schema> physical_schema, std::vector<int> row_groups);
+      std::shared_ptr<Schema> physical_schema, std::vector<int> row_groups,
+      std::shared_ptr<ParquetColumnIndexProvider> column_index_provider = NULLPTR);
 
   /// \brief Return a FileReader on the given source.
   Result<std::shared_ptr<parquet::arrow::FileReader>> GetReader(
@@ -164,8 +186,15 @@ class ARROW_DS_EXPORT ParquetFileFragment : public FileFragment {
   /// \brief Return the FileMetaData associated with this fragment.
   const std::shared_ptr<parquet::FileMetaData>& metadata() const { return metadata_; }
 
+  const std::shared_ptr<ParquetFileFormat> parquet_format() const;
+
+  Result<bool> HasCompleteMetadata(
+      const util::optional<compute::Expression>& maybe_predicate = util::nullopt);
+
   /// \brief Ensure this fragment's FileMetaData is in memory.
-  Status EnsureCompleteMetadata(parquet::arrow::FileReader* reader = NULLPTR);
+  Status EnsureCompleteMetadata(
+      const util::optional<compute::Expression>& maybe_predicate = util::nullopt,
+      std::shared_ptr<parquet::arrow::FileReader> reader = NULLPTR);
 
   /// \brief Return fragment which selects a filtered subset of this fragment's RowGroups.
   Result<std::shared_ptr<Fragment>> Subset(compute::Expression predicate);
@@ -175,10 +204,11 @@ class ARROW_DS_EXPORT ParquetFileFragment : public FileFragment {
       const Field& field, const parquet::Statistics& statistics);
 
  private:
-  ParquetFileFragment(FileSource source, std::shared_ptr<FileFormat> format,
-                      compute::Expression partition_expression,
-                      std::shared_ptr<Schema> physical_schema,
-                      std::optional<std::vector<int>> row_groups);
+  ParquetFileFragment(
+      FileSource source, std::shared_ptr<FileFormat> format,
+      compute::Expression partition_expression, std::shared_ptr<Schema> physical_schema,
+      std::optional<std::vector<int>> row_groups,
+      std::shared_ptr<ParquetColumnIndexProvider> column_index_provider = NULLPTR);
 
   Status SetMetadata(std::shared_ptr<parquet::FileMetaData> metadata,
                      std::shared_ptr<parquet::arrow::SchemaManifest> manifest);
@@ -198,7 +228,8 @@ class ARROW_DS_EXPORT ParquetFileFragment : public FileFragment {
   /// simplified against the partition expression already.
   Result<std::optional<int64_t>> TryCountRows(compute::Expression predicate);
 
-  ParquetFileFormat& parquet_format_;
+  Result<compute::Expression> SimplifyPredicate(
+      compute::Expression predicate);
 
   /// Indices of row groups selected by this fragment,
   /// or std::nullopt if all row groups are selected.
@@ -208,6 +239,7 @@ class ARROW_DS_EXPORT ParquetFileFragment : public FileFragment {
   std::vector<bool> statistics_expressions_complete_;
   std::shared_ptr<parquet::FileMetaData> metadata_;
   std::shared_ptr<parquet::arrow::SchemaManifest> manifest_;
+  std::shared_ptr<ParquetColumnIndexProvider> column_index_provider_;
 
   friend class ParquetFileFormat;
   friend class ParquetDatasetFactory;
@@ -353,7 +385,8 @@ class ARROW_DS_EXPORT ParquetDatasetFactory : public DatasetFactory {
       std::shared_ptr<parquet::arrow::SchemaManifest> manifest,
       std::shared_ptr<Schema> physical_schema, std::string base_path,
       ParquetFactoryOptions options,
-      std::vector<std::pair<std::string, std::vector<int>>> paths_with_row_group_ids)
+      std::vector<std::pair<std::string, std::vector<int>>> paths_with_row_group_ids,
+      std::shared_ptr<ParquetColumnIndexProvider> column_index_provider)
       : filesystem_(std::move(filesystem)),
         format_(std::move(format)),
         metadata_(std::move(metadata)),
@@ -361,7 +394,8 @@ class ARROW_DS_EXPORT ParquetDatasetFactory : public DatasetFactory {
         physical_schema_(std::move(physical_schema)),
         base_path_(std::move(base_path)),
         options_(std::move(options)),
-        paths_with_row_group_ids_(std::move(paths_with_row_group_ids)) {}
+        paths_with_row_group_ids_(std::move(paths_with_row_group_ids)),
+        column_index_provider_(std::move(column_index_provider)) {}
 
   std::shared_ptr<fs::FileSystem> filesystem_;
   std::shared_ptr<ParquetFileFormat> format_;
@@ -371,6 +405,7 @@ class ARROW_DS_EXPORT ParquetDatasetFactory : public DatasetFactory {
   std::string base_path_;
   ParquetFactoryOptions options_;
   std::vector<std::pair<std::string, std::vector<int>>> paths_with_row_group_ids_;
+  std::shared_ptr<ParquetColumnIndexProvider> column_index_provider_;
 
  private:
   Result<std::vector<std::shared_ptr<FileFragment>>> CollectParquetFragments(

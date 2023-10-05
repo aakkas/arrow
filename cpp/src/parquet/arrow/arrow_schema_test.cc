@@ -36,6 +36,8 @@
 #include "arrow/util/key_value_metadata.h"
 
 using arrow::Field;
+using arrow::FieldPath;
+using arrow::FieldRef;
 using arrow::TimeUnit;
 
 using ParquetType = parquet::Type;
@@ -83,16 +85,48 @@ class TestConvertParquetSchema : public ::testing::Test {
 
   ::arrow::Status ConvertSchema(
       const std::vector<NodePtr>& nodes,
-      const std::shared_ptr<const KeyValueMetadata>& key_value_metadata = nullptr) {
+      const std::shared_ptr<const KeyValueMetadata>& key_value_metadata = nullptr,
+      bool make_manifest = false) {
     NodePtr schema = GroupNode::Make("schema", Repetition::REPEATED, nodes);
     descr_.Init(schema);
     ArrowReaderProperties props;
-    return FromParquetSchema(&descr_, props, key_value_metadata, &result_schema_);
+
+    ARROW_RETURN_NOT_OK(
+        FromParquetSchema(&descr_, props, key_value_metadata, &result_schema_));
+
+    manifest_.release();
+    if (make_manifest) {
+      return MakeManifest();
+    }
+
+    return ::arrow::Status::OK();
+  }
+
+  ::arrow::Status MakeManifest() {
+    manifest_.reset(new SchemaManifest());
+    return SchemaManifest::Make(&descr_,
+                                std::shared_ptr<const ::arrow::KeyValueMetadata>(),
+                                ArrowReaderProperties(), manifest_.get());
+  }
+
+  void CheckField(const FieldRef& ref, const Field& expected_field) {
+    ASSERT_OK_AND_ASSIGN(auto match, ref.FindOne(*result_schema_));
+    EXPECT_FALSE(match.empty());
+
+    ASSERT_OK_AND_ASSIGN(auto found_field, match.Get(*result_schema_));
+    EXPECT_NE(found_field, nullptr);
+    EXPECT_TRUE(found_field->Equals(expected_field));
+
+    ASSERT_OK_AND_ASSIGN(auto schema_field, manifest_->Get(match));
+    EXPECT_NE(schema_field, nullptr);
+
+    EXPECT_TRUE(schema_field->field->Equals(found_field));
   }
 
  protected:
   SchemaDescriptor descr_;
   std::shared_ptr<::arrow::Schema> result_schema_;
+  std::unique_ptr<SchemaManifest> manifest_;
 };
 
 TEST_F(TestConvertParquetSchema, ParquetFlatPrimitives) {
@@ -166,6 +200,10 @@ TEST_F(TestConvertParquetSchema, ParquetFlatPrimitives) {
   ASSERT_OK(ConvertSchema(parquet_fields));
 
   ASSERT_NO_FATAL_FAILURE(CheckFlatSchema(arrow_schema));
+
+  ASSERT_OK(MakeManifest());
+  ASSERT_NO_FATAL_FAILURE(CheckField(FieldRef("boolean"), *arrow_fields[0]));
+  ASSERT_NO_FATAL_FAILURE(CheckField(FieldRef("int32"), *arrow_fields[1]));
 }
 
 TEST_F(TestConvertParquetSchema, ParquetAnnotatedFields) {
@@ -356,6 +394,15 @@ TEST_F(TestConvertParquetSchema, ParquetMaps) {
 
   // Two column map.
   {
+    /*
+    required group my_map (MAP) {     --> arrow_fields[0] = {name: my_map type: arrow_map}
+      repeated group key_value {      --> arrow_map       = {name: my_map type: _struct{arrow_key, arrow_value}}
+        required binary key (UTF8);   --> arrow_key       = {name: key,   type: UTF8}
+        optional binary value (UTF8); --> arrow_value     = {name: value, type: UTF8}
+      }
+    }
+    */
+
     auto key = PrimitiveNode::Make("key", Repetition::REQUIRED, ParquetType::BYTE_ARRAY,
                                    ConvertedType::UTF8);
     auto value = PrimitiveNode::Make("value", Repetition::OPTIONAL,
@@ -366,9 +413,9 @@ TEST_F(TestConvertParquetSchema, ParquetMaps) {
         GroupNode::Make("my_map", Repetition::REQUIRED, {list}, LogicalType::Map()));
     auto arrow_key = ::arrow::field("key", UTF8, /*nullable=*/false);
     auto arrow_value = ::arrow::field("value", UTF8, /*nullable=*/true);
+    
     auto arrow_map = std::make_shared<::arrow::MapType>(
-        ::arrow::field("my_map", ::arrow::struct_({arrow_key, arrow_value}),
-                       /*nullable=*/false),
+        ::arrow::field("my_map", ::arrow::struct_({arrow_key, arrow_value}), /*nullable=*/false),
         /*nullable=*/false);
 
     arrow_fields.push_back(::arrow::field("my_map", arrow_map, /*nullable=*/false));
@@ -418,6 +465,15 @@ TEST_F(TestConvertParquetSchema, ParquetMaps) {
           << "\n expected: " << expected_field->type()->field(0)->ToString() << "\n";
     }
   }
+
+  auto x = arrow_fields[0]->type()->fields()[0];
+
+  ASSERT_OK(MakeManifest());
+  ASSERT_NO_FATAL_FAILURE(CheckField(FieldRef("my_map"), *arrow_fields[0]));
+  
+  ASSERT_NO_FATAL_FAILURE(CheckField(FieldRef("my_map", 0, 1), *arrow_fields[0]->type()->field(0)->type()->field(1)));
+  // ASSERT_NO_FATAL_FAILURE(CheckField(FieldRef("my_set"), *arrow_fields[1]));
+  // ASSERT_NO_FATAL_FAILURE(CheckField(FieldRef("items"), *arrow_fields[2]));
 }
 
 TEST_F(TestConvertParquetSchema, ParquetLists) {

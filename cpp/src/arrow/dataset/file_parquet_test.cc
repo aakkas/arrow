@@ -424,6 +424,8 @@ TEST_F(TestParquetFileSystemDataset, WriteWithEmptyPartitioningSchema) {
   TestWriteWithEmptyPartitioningSchema();
 }
 
+
+
 class TestParquetFileFormatScan : public FileFormatScanMixin<ParquetFormatHelper> {
  public:
   std::shared_ptr<RecordBatch> SingleBatch(std::shared_ptr<Fragment> fragment) {

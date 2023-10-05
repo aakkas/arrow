@@ -135,6 +135,7 @@ static constexpr int64_t DEFAULT_WRITE_BATCH_SIZE = 1024;
 static constexpr int64_t DEFAULT_MAX_ROW_GROUP_LENGTH = 1024 * 1024;
 static constexpr bool DEFAULT_ARE_STATISTICS_ENABLED = true;
 static constexpr int64_t DEFAULT_MAX_STATISTICS_SIZE = 4096;
+static constexpr bool DEFAULT_ARE_COLUMN_INDEXES_ENABLED = false;
 static constexpr Encoding::type DEFAULT_ENCODING = Encoding::UNKNOWN;
 static const char DEFAULT_CREATED_BY[] = CREATED_BY_VERSION;
 static constexpr Compression::type DEFAULT_COMPRESSION_TYPE = Compression::UNCOMPRESSED;
@@ -147,13 +148,15 @@ class PARQUET_EXPORT ColumnProperties {
                    bool dictionary_enabled = DEFAULT_IS_DICTIONARY_ENABLED,
                    bool statistics_enabled = DEFAULT_ARE_STATISTICS_ENABLED,
                    size_t max_stats_size = DEFAULT_MAX_STATISTICS_SIZE,
-                   bool page_index_enabled = DEFAULT_IS_PAGE_INDEX_ENABLED)
+                   bool page_index_enabled = DEFAULT_IS_PAGE_INDEX_ENABLED,
+                   bool column_index_enabled = DEFAULT_ARE_COLUMN_INDEXES_ENABLED)                   
       : encoding_(encoding),
         codec_(codec),
         dictionary_enabled_(dictionary_enabled),
         statistics_enabled_(statistics_enabled),
         max_stats_size_(max_stats_size),
-        page_index_enabled_(page_index_enabled) {}
+        page_index_enabled_(page_index_enabled),
+        column_index_enabled_(column_index_enabled) {}
 
   void set_encoding(Encoding::type encoding) { encoding_ = encoding; }
 
@@ -169,6 +172,10 @@ class PARQUET_EXPORT ColumnProperties {
 
   void set_max_statistics_size(size_t max_stats_size) {
     max_stats_size_ = max_stats_size;
+  }
+
+  void set_column_index_enabled(bool column_index_enabled) {
+    column_index_enabled_ = column_index_enabled;
   }
 
   void set_compression_level(int compression_level) {
@@ -196,6 +203,8 @@ class PARQUET_EXPORT ColumnProperties {
 
   size_t max_statistics_size() const { return max_stats_size_; }
 
+  bool column_index_enabled() const { return column_index_enabled_; }
+
   int compression_level() const { return codec_options_->compression_level; }
 
   const std::shared_ptr<CodecOptions>& codec_options() const { return codec_options_; }
@@ -210,6 +219,7 @@ class PARQUET_EXPORT ColumnProperties {
   size_t max_stats_size_;
   std::shared_ptr<CodecOptions> codec_options_;
   bool page_index_enabled_;
+  bool column_index_enabled_;
 };
 
 class PARQUET_EXPORT WriterProperties {
@@ -532,6 +542,46 @@ class PARQUET_EXPORT WriterProperties {
       return this->disable_statistics(path->ToDotString());
     }
 
+    /// Enable column indexes in general.
+    /// Default disabled.
+    Builder* enable_column_index() {
+      default_column_properties_.set_column_index_enabled(true);
+      return this;
+    }
+
+    /// Disable statistics in general.
+    /// Default disabled.
+    Builder* disable_column_index() {
+      default_column_properties_.set_column_index_enabled(false);
+      return this;
+    }
+
+    /// Enable column index for the column specified by `path`.
+    /// Default disabled.
+    Builder* enable_column_index(const std::string& path) {
+      column_index_enabled_[path] = true;
+      return this;
+    }
+
+    /// Enable statistics for the column specified by `path`.
+    /// Default disabled.
+    Builder* enable_column_index(const std::shared_ptr<schema::ColumnPath>& path) {
+      return this->enable_column_index(path->ToDotString());
+    }
+
+    /// Disable statistics for the column specified by `path`.
+    /// Default disabled.
+    Builder* disable_column_index(const std::string& path) {
+      column_index_enabled_[path] = false;
+      return this;
+    }
+
+    /// Disable statistics for the column specified by `path`.
+    /// Default disabled.
+    Builder* disable_column_index(const std::shared_ptr<schema::ColumnPath>& path) {
+      return this->disable_column_index(path->ToDotString());
+    }
+
     /// Allow decimals with 1 <= precision <= 18 to be stored as integers.
     ///
     /// In Parquet, DECIMAL can be stored in any of the following physical types:
@@ -629,6 +679,8 @@ class PARQUET_EXPORT WriterProperties {
         get(item.first).set_statistics_enabled(item.second);
       for (const auto& item : page_index_enabled_)
         get(item.first).set_page_index_enabled(item.second);
+      for (const auto& item : column_index_enabled_)
+        get(item.first).set_column_index_enabled(item.second);
 
       return std::shared_ptr<WriterProperties>(new WriterProperties(
           pool_, dictionary_pagesize_limit_, write_batch_size_, max_row_group_length_,
@@ -663,6 +715,7 @@ class PARQUET_EXPORT WriterProperties {
     std::unordered_map<std::string, bool> dictionary_enabled_;
     std::unordered_map<std::string, bool> statistics_enabled_;
     std::unordered_map<std::string, bool> page_index_enabled_;
+    std::unordered_map<std::string, bool> column_index_enabled_;
   };
 
   inline MemoryPool* memory_pool() const { return pool_; }
@@ -739,6 +792,10 @@ class PARQUET_EXPORT WriterProperties {
 
   size_t max_statistics_size(const std::shared_ptr<schema::ColumnPath>& path) const {
     return column_properties(path).max_statistics_size();
+  }
+
+  bool column_index_enabled(const std::shared_ptr<schema::ColumnPath>& path) const {
+    return column_properties(path).column_index_enabled();
   }
 
   bool page_index_enabled(const std::shared_ptr<schema::ColumnPath>& path) const {

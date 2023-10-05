@@ -34,9 +34,11 @@
 #include "arrow/util/future.h"
 #include "arrow/util/int_util_overflow.h"
 #include "arrow/util/logging.h"
+#include "arrow/util/optional.h"
 #include "arrow/util/ubsan.h"
 #include "parquet/bloom_filter.h"
 #include "parquet/bloom_filter_reader.h"
+#include "parquet/column_index.h"
 #include "parquet/column_reader.h"
 #include "parquet/column_scanner.h"
 #include "parquet/encryption/encryption_internal.h"
@@ -48,9 +50,12 @@
 #include "parquet/platform.h"
 #include "parquet/properties.h"
 #include "parquet/schema.h"
+#include "parquet/thrift_internal.h"
 #include "parquet/types.h"
 
 using arrow::internal::AddWithOverflow;
+using arrow::util::nullopt;
+using arrow::util::optional;
 
 namespace parquet {
 
@@ -80,6 +85,28 @@ std::shared_ptr<ColumnReader> RowGroupReader::Column(int i) {
   return ColumnReader::Make(
       descr, std::move(page_reader),
       const_cast<ReaderProperties*>(contents_->properties())->memory_pool());
+}
+
+std::shared_ptr<parquet::ColumnIndex> RowGroupReader::ReadColumnIndex(int column) {
+  if (column >= metadata()->num_columns()) {
+    std::stringstream ss;
+    ss << "Trying to read column index " << column << " but row group metadata has only "
+       << metadata()->num_columns() << " columns";
+    throw ParquetException(ss.str());
+  }
+
+  return contents_->ReadColumnIndex(column);
+}
+
+std::shared_ptr<parquet::OffsetIndex> RowGroupReader::ReadOffsetIndex(int column) {
+  if (column >= metadata()->num_columns()) {
+    std::stringstream ss;
+    ss << "Trying to read offset index " << column << " but row group metadata has only "
+       << metadata()->num_columns() << " columns";
+    throw ParquetException(ss.str());
+  }
+
+  return contents_->ReadOffsetIndex(column);
 }
 
 std::shared_ptr<ColumnReader> RowGroupReader::ColumnWithExposeEncoding(
@@ -244,6 +271,110 @@ class SerializedRowGroup : public RowGroupReader::Contents {
                       static_cast<int16_t>(i), meta_decryptor, data_decryptor);
     return PageReader::Open(stream, col->num_values(), col->compression(), properties_,
                             always_compressed, &ctx);
+  }
+
+  std::shared_ptr<Decryptor> GetMetadataDecryptor(
+      const ColumnChunkMetaData& column_metadata, int8_t module_type) {
+    std::shared_ptr<Decryptor> decryptor;
+    auto cryto_metadata = column_metadata.crypto_metadata();
+    if (cryto_metadata != nullptr) {
+      if (cryto_metadata->encrypted_with_footer_key()) {
+        decryptor = file_decryptor_->GetFooterDecryptor();
+      } else {
+        std::string aad_column_metadata = encryption::CreateModuleAad(
+            file_decryptor_->file_aad(), module_type, column_metadata.row_group_ordinal(),
+            column_metadata.column_ordinal(), static_cast<int16_t>(-1));
+
+        decryptor = file_decryptor_->GetColumnMetaDecryptor(
+            cryto_metadata->path_in_schema()->ToDotString(),
+            cryto_metadata->key_metadata(), aad_column_metadata);
+      }
+    }
+
+    return decryptor;
+  }
+
+  std::shared_ptr<parquet::ColumnIndex> ReadColumnIndex(int column) override {
+    auto column_metadata = metadata()->ColumnChunk(column);
+    if (!column_metadata->has_column_index()) {
+      return NULLPTR;
+    }
+
+    int64_t to_read = column_metadata->column_index_length();
+    PARQUET_ASSIGN_OR_THROW(
+        auto buffer, source_->ReadAt(column_metadata->column_index_offset(), to_read));
+    DCHECK_GE(buffer->size(), to_read);
+
+    auto decryptor = GetMetadataDecryptor(*column_metadata, encryption::kColumnIndex);
+
+    return ColumnIndex::Deserialize(column_metadata->descr(), *buffer, decryptor);
+  }
+
+  std::shared_ptr<parquet::OffsetIndex> ReadOffsetIndex(int column) override {
+    auto column_metadata = metadata()->ColumnChunk(column);
+    if (!column_metadata->has_offset_index()) {
+      return NULLPTR;
+    }
+
+    int64_t to_read = column_metadata->offset_index_length();
+    PARQUET_ASSIGN_OR_THROW(
+        auto buffer, source_->ReadAt(column_metadata->offset_index_offset(), to_read));
+    DCHECK_GE(buffer->size(), to_read);
+
+    auto decryptor = GetMetadataDecryptor(*column_metadata, encryption::kOffsetIndex);
+    return OffsetIndex::Deserialize(metadata()->num_rows(), *buffer, decryptor);
+  }
+
+  std::shared_ptr<Decryptor> GetMetadataDecryptor(
+      const ColumnChunkMetaData& column_metadata, int8_t module_type) {
+    std::shared_ptr<Decryptor> decryptor;
+    auto cryto_metadata = column_metadata.crypto_metadata();
+    if (cryto_metadata != nullptr) {
+      if (cryto_metadata->encrypted_with_footer_key()) {
+        decryptor = file_decryptor_->GetFooterDecryptor();
+      } else {
+        std::string aad_column_metadata = encryption::CreateModuleAad(
+            file_decryptor_->file_aad(), module_type, column_metadata.row_group_ordinal(),
+            column_metadata.column_ordinal(), static_cast<int16_t>(-1));
+
+        decryptor = file_decryptor_->GetColumnMetaDecryptor(
+            cryto_metadata->path_in_schema()->ToDotString(),
+            cryto_metadata->key_metadata(), aad_column_metadata);
+      }
+    }
+
+    return decryptor;
+  }
+
+  std::shared_ptr<parquet::ColumnIndex> ReadColumnIndex(int column) override {
+    auto column_metadata = metadata()->ColumnChunk(column);
+    if (!column_metadata->has_column_index()) {
+      return NULLPTR;
+    }
+
+    int64_t to_read = column_metadata->column_index_length();
+    PARQUET_ASSIGN_OR_THROW(
+        auto buffer, source_->ReadAt(column_metadata->column_index_offset(), to_read));
+    DCHECK_GE(buffer->size(), to_read);
+
+    auto decryptor = GetMetadataDecryptor(*column_metadata, encryption::kColumnIndex);
+
+    return ColumnIndex::Deserialize(column_metadata->descr(), *buffer, decryptor);
+  }
+
+  std::shared_ptr<parquet::OffsetIndex> ReadOffsetIndex(int column) override {
+    auto column_metadata = metadata()->ColumnChunk(column);
+    if (!column_metadata->has_offset_index()) {
+      return NULLPTR;
+    }
+
+    int64_t to_read = column_metadata->offset_index_length();
+    PARQUET_ASSIGN_OR_THROW(
+        auto buffer, source_->ReadAt(column_metadata->offset_index_offset(), to_read));
+    DCHECK_GE(buffer->size(), to_read);
+
+    auto decryptor = GetMetadataDecryptor(*column_metadata, encryption::kOffsetIndex);
+    return OffsetIndex::Deserialize(metadata()->num_rows(), *buffer, decryptor);
   }
 
  private:

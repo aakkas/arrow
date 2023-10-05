@@ -233,6 +233,7 @@ set(ARROW_SRCS
     util/memory.cc
     util/mutex.cc
     util/ree_util.cc
+    util/row_ranges.cc
     util/string.cc
     util/string_builder.cc
     util/task_group.cc

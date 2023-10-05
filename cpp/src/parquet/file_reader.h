@@ -27,6 +27,7 @@
 #include "parquet/metadata.h"  // IWYU pragma: keep
 #include "parquet/platform.h"
 #include "parquet/properties.h"
+#include "parquet/column_index.h"
 
 namespace parquet {
 
@@ -47,6 +48,8 @@ class PARQUET_EXPORT RowGroupReader {
     virtual std::unique_ptr<PageReader> GetColumnPageReader(int i) = 0;
     virtual const RowGroupMetaData* metadata() const = 0;
     virtual const ReaderProperties* properties() const = 0;
+    virtual std::shared_ptr<parquet::ColumnIndex> ReadColumnIndex(int column) = 0;
+    virtual std::shared_ptr<parquet::OffsetIndex> ReadOffsetIndex(int column) = 0;
   };
 
   explicit RowGroupReader(std::unique_ptr<Contents> contents);
@@ -57,6 +60,14 @@ class PARQUET_EXPORT RowGroupReader {
   // Construct a ColumnReader for the indicated row group-relative
   // column. Ownership is shared with the RowGroupReader.
   std::shared_ptr<ColumnReader> Column(int i);
+
+  // Construct a ColumnIndex for the indicated row group-relative
+  // column.
+  std::shared_ptr<ColumnIndex> ReadColumnIndex(int column);
+
+  // Construct an OffsetIndex for the indicated row group-relative
+  // column.
+  std::shared_ptr<parquet::OffsetIndex> ReadOffsetIndex(int column);
 
   // Construct a ColumnReader, trying to enable exposed encoding.
   //

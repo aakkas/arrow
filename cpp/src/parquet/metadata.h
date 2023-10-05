@@ -39,6 +39,13 @@ class FileCryptoMetaData;
 class Statistics;
 class SchemaDescriptor;
 
+class FileCryptoMetaData;
+class InternalFileDecryptor;
+class Decryptor;
+class Encryptor;
+class FooterSigningEncryptor;
+struct IndexLocation;
+
 namespace schema {
 
 class ColumnPath;
@@ -146,6 +153,12 @@ class PARQUET_EXPORT ColumnChunkMetaData {
 
   bool Equals(const ColumnChunkMetaData& other) const;
 
+  int16_t row_group_ordinal() const;
+
+  int16_t column_ordinal() const;
+
+  const ColumnDescriptor* descr() const;
+
   // column chunk
   int64_t file_offset() const;
 
@@ -178,6 +191,14 @@ class PARQUET_EXPORT ColumnChunkMetaData {
   std::unique_ptr<ColumnCryptoMetaData> crypto_metadata() const;
   std::optional<IndexLocation> GetColumnIndexLocation() const;
   std::optional<IndexLocation> GetOffsetIndexLocation() const;
+  bool has_column_index() const;
+  int64_t column_index_offset() const;
+  int32_t column_index_length() const;
+  bool has_offset_index() const;
+  int64_t offset_index_offset() const;
+  int32_t offset_index_length() const;
+  bool has_bloom_filter() const;
+  int64_t bloom_filter_offset() const;
 
  private:
   explicit ColumnChunkMetaData(
@@ -447,6 +468,11 @@ class PARQUET_EXPORT ColumnChunkMetaDataBuilder {
   void set_file_path(const std::string& path);
   // column metadata
   void SetStatistics(const EncodedStatistics& stats);
+
+  void SetColumnIndexLocation(const IndexLocation& location);
+
+  void SetOffsetIndexLocation(const IndexLocation& location);
+
   // get the column descriptor
   const ColumnDescriptor* descr() const;
 
@@ -544,6 +570,10 @@ class PARQUET_EXPORT FileMetaDataBuilder {
 
   // crypto metadata
   std::unique_ptr<FileCryptoMetaData> GetCryptoMetaData();
+
+  void SetColumnIndexLocation(int row_group, int column, const IndexLocation& location);
+
+  void SetOffsetIndexLocation(int row_group, int column, const IndexLocation& location);
 
  private:
   explicit FileMetaDataBuilder(

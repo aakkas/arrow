@@ -168,6 +168,7 @@ set(PARQUET_SRCS
     arrow/writer.cc
     bloom_filter.cc
     bloom_filter_reader.cc
+    column_index.cc
     column_reader.cc
     column_scanner.cc
     column_writer.cc

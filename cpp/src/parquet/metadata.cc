@@ -28,6 +28,7 @@
 #include "arrow/io/memory.h"
 #include "arrow/util/key_value_metadata.h"
 #include "arrow/util/logging.h"
+#include "parquet/column_index.h"
 #include "parquet/encryption/encryption_internal.h"
 #include "parquet/encryption/internal_file_decryptor.h"
 #include "parquet/exception.h"
@@ -188,8 +189,12 @@ class ColumnChunkMetaData::ColumnChunkMetaDataImpl {
                                    const ApplicationVersion* writer_version,
                                    std::shared_ptr<InternalFileDecryptor> file_decryptor)
       : column_(column),
+       
         descr_(descr),
         properties_(properties),
+       
+        row_group_ordinal_(row_group_ordinal),
+        column_ordinal_(column_ordinal),
         writer_version_(writer_version) {
     column_metadata_ = &column->meta_data;
     if (column->__isset.crypto_metadata) {  // column metadata is encrypted
@@ -236,6 +241,13 @@ class ColumnChunkMetaData::ColumnChunkMetaDataImpl {
   }
 
   // column chunk
+
+  inline int16_t row_group_ordinal() const { return row_group_ordinal_; }
+
+  inline int16_t column_ordinal() const { return column_ordinal_; }
+
+  inline const ColumnDescriptor* descr() const { return descr_; }
+
   inline int64_t file_offset() const { return column_->file_offset; }
   inline const std::string& file_path() const { return column_->file_path; }
 
@@ -332,6 +344,26 @@ class ColumnChunkMetaData::ColumnChunkMetaDataImpl {
     return std::nullopt;
   }
 
+  inline bool has_column_index() const { return column_->__isset.column_index_offset; }
+
+  inline int64_t column_index_offset() const { return column_->column_index_offset; }
+
+  inline int32_t column_index_length() const { return column_->column_index_length; }
+
+  inline bool has_offset_index() const { return column_->__isset.offset_index_offset; }
+
+  inline int64_t offset_index_offset() const { return column_->offset_index_offset; }
+
+  inline int32_t offset_index_length() const { return column_->offset_index_length; }
+
+  inline bool has_bloom_filter() const {
+    return column_metadata_->__isset.bloom_filter_offset;
+  }
+
+  inline int64_t bloom_filter_offset() const {
+    return column_metadata_->bloom_filter_offset;
+  }
+
  private:
   mutable std::shared_ptr<Statistics> possible_stats_;
   std::vector<Encoding::type> encodings_;
@@ -341,6 +373,8 @@ class ColumnChunkMetaData::ColumnChunkMetaDataImpl {
   format::ColumnMetaData decrypted_metadata_;
   const ColumnDescriptor* descr_;
   const ReaderProperties properties_;
+  int16_t row_group_ordinal_;
+  int16_t column_ordinal_;
   const ApplicationVersion* writer_version_;
 };
 
@@ -376,6 +410,15 @@ ColumnChunkMetaData::ColumnChunkMetaData(
 ColumnChunkMetaData::~ColumnChunkMetaData() = default;
 
 // column chunk
+
+int16_t ColumnChunkMetaData::row_group_ordinal() const {
+  return impl_->row_group_ordinal();
+}
+
+int16_t ColumnChunkMetaData::column_ordinal() const { return impl_->column_ordinal(); }
+
+const ColumnDescriptor* ColumnChunkMetaData::descr() const { return impl_->descr(); }
+
 int64_t ColumnChunkMetaData::file_offset() const { return impl_->file_offset(); }
 
 const std::string& ColumnChunkMetaData::file_path() const { return impl_->file_path(); }
@@ -450,6 +493,32 @@ std::optional<IndexLocation> ColumnChunkMetaData::GetColumnIndexLocation() const
 
 std::optional<IndexLocation> ColumnChunkMetaData::GetOffsetIndexLocation() const {
   return impl_->GetOffsetIndexLocation();
+}
+
+bool ColumnChunkMetaData::has_column_index() const { return impl_->has_column_index(); }
+
+int64_t ColumnChunkMetaData::column_index_offset() const {
+  return impl_->column_index_offset();
+}
+
+int32_t ColumnChunkMetaData::column_index_length() const {
+  return impl_->column_index_length();
+}
+
+bool ColumnChunkMetaData::has_offset_index() const { return impl_->has_offset_index(); }
+
+int64_t ColumnChunkMetaData::offset_index_offset() const {
+  return impl_->offset_index_offset();
+}
+
+int32_t ColumnChunkMetaData::offset_index_length() const {
+  return impl_->offset_index_length();
+}
+
+bool ColumnChunkMetaData::has_bloom_filter() const { return impl_->has_bloom_filter(); }
+
+int64_t ColumnChunkMetaData::bloom_filter_offset() const {
+  return impl_->bloom_filter_offset();
 }
 
 bool ColumnChunkMetaData::Equals(const ColumnChunkMetaData& other) const {
@@ -1412,6 +1481,16 @@ bool ApplicationVersion::HasCorrectStatistics(Type::type col_type,
   return true;
 }
 
+void SetColumnIndexLoc(format::ColumnChunk& column_chunk, const IndexLocation& location) {
+  column_chunk.__set_column_index_offset(location.offset);
+  column_chunk.__set_column_index_length(location.length);
+}
+
+void SetOffsetIndexLoc(format::ColumnChunk& column_chunk, const IndexLocation& location) {
+  column_chunk.__set_offset_index_offset(location.offset);
+  column_chunk.__set_offset_index_length(location.length);
+}
+
 // MetaData Builders
 // row-group metadata
 class ColumnChunkMetaDataBuilder::ColumnChunkMetaDataBuilderImpl {
@@ -1439,6 +1518,14 @@ class ColumnChunkMetaDataBuilder::ColumnChunkMetaDataBuilderImpl {
   // column metadata
   void SetStatistics(const EncodedStatistics& val) {
     column_chunk_->meta_data.__set_statistics(ToThrift(val));
+  }
+
+  void SetColumnIndexLocation(const IndexLocation& location) {
+    SetColumnIndexLoc(*column_chunk_, location);
+  }
+
+  void SetOffsetIndexLocation(const IndexLocation& location) {
+    SetOffsetIndexLoc(*column_chunk_, location);
   }
 
   void Finish(int64_t num_values, int64_t dictionary_page_offset,
@@ -1642,6 +1729,14 @@ const ColumnDescriptor* ColumnChunkMetaDataBuilder::descr() const {
 
 void ColumnChunkMetaDataBuilder::SetStatistics(const EncodedStatistics& result) {
   impl_->SetStatistics(result);
+}
+
+void ColumnChunkMetaDataBuilder::SetColumnIndexLocation(const IndexLocation& location) {
+  impl_->SetColumnIndexLocation(location);
+}
+
+void ColumnChunkMetaDataBuilder::SetOffsetIndexLocation(const IndexLocation& location) {
+  impl_->SetOffsetIndexLocation(location);
 }
 
 int64_t ColumnChunkMetaDataBuilder::total_compressed_size() const {
@@ -1926,6 +2021,22 @@ class FileMetaDataBuilder::FileMetaDataBuilderImpl {
     return file_crypto_metadata;
   }
 
+  void SetColumnIndexLocation(int row_group, int column, const IndexLocation& location) {
+    DCHECK_LT(row_group, static_cast<int>(row_groups_.size()));
+    auto& rg = row_groups_[row_group];
+
+    DCHECK_LT(column, static_cast<int>(rg.columns.size()));
+    SetColumnIndexLoc(rg.columns[column], location);
+  }
+
+  void SetOffsetIndexLocation(int row_group, int column, const IndexLocation& location) {
+    DCHECK_LT(row_group, static_cast<int>(row_groups_.size()));
+    auto& rg = row_groups_[row_group];
+
+    DCHECK_LT(column, static_cast<int>(rg.columns.size()));
+    SetOffsetIndexLoc(rg.columns[column], location);
+  }
+
  protected:
   std::unique_ptr<format::FileMetaData> metadata_;
   std::unique_ptr<format::FileCryptoMetaData> crypto_metadata_;
@@ -1975,6 +2086,16 @@ std::unique_ptr<FileMetaData> FileMetaDataBuilder::Finish(
 
 std::unique_ptr<FileCryptoMetaData> FileMetaDataBuilder::GetCryptoMetaData() {
   return impl_->BuildFileCryptoMetaData();
+}
+
+void FileMetaDataBuilder::SetColumnIndexLocation(int row_group, int column,
+                                                 const IndexLocation& location) {
+  impl_->SetColumnIndexLocation(row_group, column, location);
+}
+
+void FileMetaDataBuilder::SetOffsetIndexLocation(int row_group, int column,
+                                                 const IndexLocation& location) {
+  impl_->SetOffsetIndexLocation(row_group, column, location);
 }
 
 }  // namespace parquet
